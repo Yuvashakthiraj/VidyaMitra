@@ -1,0 +1,247 @@
+import { useState } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
+import { useToast } from '@/components/ui/use-toast';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Card, CardContent, CardHeader } from '@/components/ui/card';
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
+import { useForm } from 'react-hook-form';
+import { z } from 'zod';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { GraduationCap, AlertCircle, Eye, EyeOff } from 'lucide-react';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { motion } from 'framer-motion';
+
+const loginSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email format'),
+  password: z.string().min(6, 'Password must be at least 6 characters'),
+});
+
+const signupSchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Invalid email format'),
+  password: z.string().min(6, 'Password must be at least 6 characters'),
+  confirmPassword: z.string().min(6, 'Confirm password is required'),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: "Passwords don't match",
+  path: ['confirmPassword'],
+});
+
+type LoginFormValues = z.infer<typeof loginSchema>;
+type SignupFormValues = z.infer<typeof signupSchema>;
+
+const Login = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { login, signup } = useAuth();
+  const { toast } = useToast();
+  const [isLoading, setIsLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<string>('login');
+  const [showPassword, setShowPassword] = useState(false);
+
+  const from = location.state?.from?.pathname || '/dashboard';
+
+  const loginForm = useForm<LoginFormValues>({
+    resolver: zodResolver(loginSchema),
+    defaultValues: { email: '', password: '' },
+  });
+
+  const signupForm = useForm<SignupFormValues>({
+    resolver: zodResolver(signupSchema),
+    defaultValues: { email: '', password: '', confirmPassword: '' },
+  });
+
+  const handleLogin = async (values: LoginFormValues) => {
+    setIsLoading(true);
+    setAuthError(null);
+    try {
+      const user = await login({ email: values.email, password: values.password });
+      if (user.isAdmin) {
+        navigate('/admin');
+      } else {
+        navigate(from);
+      }
+    } catch (error: any) {
+      setAuthError(error.message || 'Invalid email or password.');
+      toast({ variant: 'destructive', title: 'Login failed', description: error.message });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleSignup = async (values: SignupFormValues) => {
+    setIsLoading(true);
+    setAuthError(null);
+    try {
+      await signup({ email: values.email, password: values.password });
+      navigate('/dashboard');
+    } catch (error: any) {
+      setAuthError(error.message || 'Signup failed.');
+      toast({ variant: 'destructive', title: 'Signup failed', description: error.message });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex min-h-screen">
+      {/* Left panel - branding */}
+      <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-br from-violet-950 via-purple-900 to-indigo-950 relative overflow-hidden">
+        <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHZpZXdCb3g9IjAgMCA2MCA2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZyBmaWxsPSJub25lIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiPjxnIGZpbGw9IiNmZmYiIGZpbGwtb3BhY2l0eT0iMC4wMyI+PHBhdGggZD0iTTM2IDM0djItSDI0di0yaDEyem0wLTR2Mkg4di0yaDI4em0tOCA2djJINC12LTJoMjR6Ii8+PC9nPjwvZz48L3N2Zz4=')] opacity-50" />
+        <div className="relative z-10 flex flex-col justify-center px-12 lg:px-16">
+          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6 }}>
+            <div className="flex items-center gap-3 mb-8">
+              <div className="w-14 h-14 rounded-2xl bg-white/10 backdrop-blur-sm flex items-center justify-center border border-white/20">
+                <GraduationCap className="h-8 w-8 text-white" />
+              </div>
+              <div>
+                <h1 className="text-3xl font-bold text-white">VidyaMitra</h1>
+                <p className="text-violet-200 text-sm">AI Career Companion</p>
+              </div>
+            </div>
+            <h2 className="text-4xl lg:text-5xl font-bold text-white mb-6 leading-tight">
+              Your Path to<br />
+              <span className="bg-gradient-to-r from-violet-300 to-pink-300 bg-clip-text text-transparent">Career Excellence</span>
+            </h2>
+            <p className="text-violet-200/80 text-lg mb-10 max-w-md">
+              AI-powered interviews, smart resume analysis, personalized career roadmaps, and real-time job matching — all in one platform.
+            </p>
+            <div className="grid grid-cols-2 gap-4 max-w-md">
+              {[
+                { label: 'Smart Resume Analysis', icon: '📄' },
+                { label: 'AI Mock Interviews', icon: '🎯' },
+                { label: 'Career Roadmaps', icon: '🗺️' },
+                { label: 'Job Matching', icon: '💼' },
+              ].map((f, i) => (
+                <motion.div
+                  key={i}
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: 0.3 + i * 0.1 }}
+                  className="flex items-center gap-2 bg-white/5 backdrop-blur-sm rounded-lg px-3 py-2.5 border border-white/10"
+                >
+                  <span className="text-lg">{f.icon}</span>
+                  <span className="text-white/90 text-xs font-medium">{f.label}</span>
+                </motion.div>
+              ))}
+            </div>
+          </motion.div>
+        </div>
+      </div>
+
+      {/* Right panel - form */}
+      <div className="flex-1 flex items-center justify-center p-6 bg-background">
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5 }}
+          className="w-full max-w-[420px]"
+        >
+          {/* Mobile logo */}
+          <div className="flex items-center gap-3 justify-center mb-8 lg:hidden">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-600 to-purple-600 flex items-center justify-center">
+              <GraduationCap className="h-6 w-6 text-white" />
+            </div>
+            <h1 className="text-2xl font-bold gradient-text">VidyaMitra</h1>
+          </div>
+
+          <Card className="border-border/50 shadow-xl">
+            <CardHeader className="pb-2">
+              <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+                <TabsList className="grid w-full grid-cols-2 bg-muted/50">
+                  <TabsTrigger value="login" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">Sign In</TabsTrigger>
+                  <TabsTrigger value="signup" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">Sign Up</TabsTrigger>
+                </TabsList>
+
+                {authError && (
+                  <Alert variant="destructive" className="mt-4">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertTitle>Error</AlertTitle>
+                    <AlertDescription>{authError}</AlertDescription>
+                  </Alert>
+                )}
+
+                <TabsContent value="login" className="mt-4">
+                  <Form {...loginForm}>
+                    <form onSubmit={loginForm.handleSubmit(handleLogin)} className="space-y-4">
+                      <FormField control={loginForm.control} name="email"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>Email</FormLabel>
+                            <FormControl><Input placeholder="you@example.com" {...field} autoComplete="email" /></FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField control={loginForm.control} name="password"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>Password</FormLabel>
+                            <FormControl>
+                              <div className="relative">
+                                <Input type={showPassword ? 'text' : 'password'} placeholder="••••••••" {...field} autoComplete="current-password" />
+                                <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                </button>
+                              </div>
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <Button type="submit" className="w-full bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-700 hover:to-purple-700 shadow-lg shadow-violet-500/20" disabled={isLoading}>
+                        {isLoading ? 'Signing in...' : 'Sign In'}
+                      </Button>
+                    </form>
+                  </Form>
+                </TabsContent>
+
+                <TabsContent value="signup" className="mt-4">
+                  <Form {...signupForm}>
+                    <form onSubmit={signupForm.handleSubmit(handleSignup)} className="space-y-4">
+                      <FormField control={signupForm.control} name="email"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>Email</FormLabel>
+                            <FormControl><Input placeholder="you@example.com" {...field} autoComplete="email" /></FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField control={signupForm.control} name="password"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>Password</FormLabel>
+                            <FormControl><Input type="password" placeholder="••••••••" {...field} autoComplete="new-password" /></FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField control={signupForm.control} name="confirmPassword"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>Confirm Password</FormLabel>
+                            <FormControl><Input type="password" placeholder="••••••••" {...field} autoComplete="new-password" /></FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <Button type="submit" className="w-full bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-700 hover:to-purple-700 shadow-lg shadow-violet-500/20" disabled={isLoading}>
+                        {isLoading ? 'Creating account...' : 'Create Account'}
+                      </Button>
+                    </form>
+                  </Form>
+                </TabsContent>
+              </Tabs>
+            </CardHeader>
+            <CardContent />
+          </Card>
+        </motion.div>
+      </div>
+    </div>
+  );
+};
+
+export default Login;

@@ -1,0 +1,43 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return request.auth.token.admin == true;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Resumes folder - users can upload their own resumes
+    match /resumes/{userId}/{fileName} {
+      // Users can read and write their own resumes
+      allow read: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      allow write: if isAuthenticated() && isOwner(userId);
+      allow delete: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      
+      // File size limit: 5MB
+      allow write: if request.resource.size < 5 * 1024 * 1024;
+      
+      // Only allow PDF and DOCX files
+      allow write: if request.resource.contentType.matches('application/pdf') ||
+                     request.resource.contentType.matches('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    }
+    
+    // Bulk resumes - only admins can access
+    match /bulk-resumes/{fileName} {
+      allow read, write: if isAdmin();
+    }
+    
+    // Default: deny all other access
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
