@@ -17,6 +17,7 @@ import { Upload, Download, FileText, CheckCircle, XCircle, Trophy, Users, Medal 
 import { toast } from "sonner";
 import { processResume, ResumeData } from "@/utils/atsParser";
 import { jobRoles } from "@/utils/interviewUtils";
+import { uploadResumeToS3 } from "@/lib/resumeService";
 
 interface ProcessedResume {
   id: string;
@@ -95,6 +96,11 @@ const handleBulkUpload = async () => {
         const resumeData = await processResume(files[i], selectedRole);
         
         console.log(`✅ [${i + 1}/${files.length}] Success: ${files[i].name} (Score: ${resumeData.atsScore}%)`);
+
+        // Upload PDF to S3
+        uploadResumeToS3(files[i]).catch(() => {
+          console.warn(`⚠️ S3 upload failed for ${files[i].name}`);
+        });
         
         processedResults.push({
           id: `resume-${Date.now()}-${i}`,

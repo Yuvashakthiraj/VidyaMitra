@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { User, LoginCredentials, AuthContextType } from '@/types/auth';
+import { User, LoginCredentials, AuthContextType, SignupCredentials, InstitutionLoginCredentials } from '@/types/auth';
 import { useToast } from '@/components/ui/use-toast';
 import { authApi, setAuthToken, getAuthToken } from '@/lib/api';
 
@@ -28,6 +28,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
             email: data.user.email,
             name: data.user.name || data.user.email.split('@')[0],
             isAdmin: data.user.isAdmin || ADMIN_EMAILS.includes(data.user.email),
+            userType: data.user.userType || (data.user.isAdmin ? 'admin' : 'student'),
+            studentCategory: data.user.studentCategory,
+            institutionId: data.user.institutionId,
+            institutionName: data.user.institutionName,
+            institutionCode: data.user.institutionCode,
           });
         }
       } catch {
@@ -49,6 +54,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         email: data.user.email,
         isAdmin: data.user.isAdmin || ADMIN_EMAILS.includes(data.user.email),
         name: data.user.name || data.user.email.split('@')[0],
+        userType: data.user.userType || (data.user.isAdmin ? 'admin' : 'student'),
+        studentCategory: data.user.studentCategory,
+        institutionId: data.user.institutionId,
+        institutionName: data.user.institutionName,
       };
 
       setUser(appUser);
@@ -67,13 +76,47 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
   };
 
-  const signup = async (credentials: LoginCredentials): Promise<User> => {
+  const institutionLogin = async (credentials: InstitutionLoginCredentials): Promise<User> => {
+    try {
+      const data = await authApi.institutionLogin(credentials.institutionId, credentials.password);
+      setAuthToken(data.token);
+
+      const appUser: User = {
+        id: data.user.id,
+        email: data.user.email,
+        isAdmin: false,
+        name: data.user.name,
+        userType: 'institution',
+        institutionCode: data.user.institutionCode,
+      };
+
+      setUser(appUser);
+
+      toast({
+        title: 'Welcome!',
+        description: `Logged in as ${data.user.name}`,
+      });
+
+      return appUser;
+    } catch (error: any) {
+      console.error('Institution login error:', error);
+      throw new Error(error.message || 'Invalid credentials. Please try again.');
+    }
+  };
+
+  const signup = async (credentials: SignupCredentials): Promise<User> => {
     try {
       if (ADMIN_EMAILS.includes(credentials.email)) {
         throw new Error('This email is reserved for admin access.');
       }
 
-      const data = await authApi.signup(credentials.email, credentials.password);
+      const data = await authApi.signup(
+        credentials.email, 
+        credentials.password, 
+        credentials.name,
+        credentials.studentCategory,
+        credentials.institutionId
+      );
       setAuthToken(data.token);
 
       const appUser: User = {
@@ -81,6 +124,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         email: data.user.email,
         isAdmin: false,
         name: data.user.name || credentials.email.split('@')[0],
+        userType: 'student',
+        studentCategory: data.user.studentCategory,
+        institutionId: data.user.institutionId,
+        institutionName: data.user.institutionName,
       };
 
       setUser(appUser);
@@ -122,7 +169,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         user,
         isAuthenticated: !!user,
         isAdmin: user?.isAdmin || false,
+        isInstitution: user?.userType === 'institution',
         login,
+        institutionLogin,
         signup,
         logout,
       }}

@@ -1,15 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Layout from '@/components/Layout';
 import { useAuth } from '@/contexts/AuthContext';
-import {
-  getUserInterviews,
-  getRound1AptitudeResults,
-  getPracticeAptitudeHistory,
-  getPracticeInterviewHistory,
-  getBotInterviewHistory,
-} from '@/lib/firebaseService';
-import { newsApi, exchangeApi } from '@/lib/api';
+import { 
+  useUserInterviews, 
+  useUserRound1Results, 
+  usePracticeAptitude, 
+  usePracticeInterviews, 
+  useBotInterviews,
+  useNews,
+  useExchangeRates 
+} from '@/hooks/useDataQueries';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -36,123 +37,99 @@ interface ActivityItem {
 const UserHome = () => {
   const navigate = useNavigate();
   const { user } = useAuth();
-  const [allActivities, setAllActivities] = useState<ActivityItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [news, setNews] = useState<any[]>([]);
-  const [exchangeRates, setExchangeRates] = useState<any>(null);
 
-  useEffect(() => {
-    const loadData = async () => {
-      if (!user) { setLoading(false); return; }
+  // Use React Query hooks for cached data
+  const { data: interviews = [], isLoading: interviewsLoading } = useUserInterviews(user?.id);
+  const { data: round1Results = [], isLoading: round1Loading } = useUserRound1Results(user?.id);
+  const { data: practiceAptitude = [], isLoading: practiceAptLoading } = usePracticeAptitude(user?.id);
+  const { data: practiceInterviews = [], isLoading: practiceIntLoading } = usePracticeInterviews(user?.id);
+  const { data: botInterviews = [], isLoading: botIntLoading } = useBotInterviews(user?.id);
+  const { data: news = [] } = useNews();
+  const { data: exchangeRates } = useExchangeRates();
 
-      const activities: ActivityItem[] = [];
+  const loading = interviewsLoading || round1Loading || practiceAptLoading || practiceIntLoading || botIntLoading;
 
-      // 1. Formal interviews (Round 2 / practice interviews saved via InterviewContext)
-      try {
-        const interviews = await getUserInterviews(user.id);
-        interviews.filter(i => i.completed).forEach(i => {
-          activities.push({
-            id: i.id,
-            type: 'interview',
-            label: i.isPracticeMode ? 'Practice Interview' : 'Mock Interview (Round 2)',
-            roleName: i.roleName || 'Unknown Role',
-            date: i.date || i.startTime || i.endTime || '',
-            score: i.score ?? null,
-            scoreMax: 10,
-          });
-        });
-      } catch (err) { console.error('Error loading interviews:', err); }
+  // Compute all activities using useMemo for performance
+  const allActivities = useMemo(() => {
+    const activities: ActivityItem[] = [];
 
-      // 2. Round 1 Aptitude results (from mock interview flow)
-      try {
-        const round1 = await getRound1AptitudeResults(user.id);
-        round1.forEach(r => {
-          activities.push({
-            id: r.id,
-            type: 'round1',
-            label: r.aborted ? 'Round 1 Aptitude (Aborted)' : 'Round 1 Aptitude',
-            roleName: r.roleName || 'Unknown Role',
-            date: r.completedAt || '',
-            score: r.aborted ? null : (r.score ?? null),
-            scoreMax: 100,
-            status: r.aborted ? 'aborted' : r.selectedForRound2 ? 'selected' : 'under-review',
-          });
-        });
-      } catch (err) { console.error('Error loading round1:', err); }
-
-      // 3. Practice aptitude
-      try {
-        const practiceApt = await getPracticeAptitudeHistory(user.id);
-        practiceApt.forEach(r => {
-          activities.push({
-            id: r.id,
-            type: 'practice-aptitude',
-            label: 'Practice Aptitude',
-            roleName: 'Aptitude Test',
-            date: r.completedAt || '',
-            score: r.score ?? null,
-            scoreMax: 100,
-          });
-        });
-      } catch (err) { console.error('Error loading practice aptitude:', err); }
-
-      // 4. Practice interviews (from Practice Hub)
-      try {
-        const practiceInt = await getPracticeInterviewHistory(user.id);
-        practiceInt.forEach(r => {
-          activities.push({
-            id: r.id,
-            type: 'practice-interview',
-            label: 'Practice Interview',
-            roleName: r.roleName || 'Unknown Role',
-            date: r.completedAt || '',
-            score: r.overallScore ?? null,
-            scoreMax: 10,
-          });
-        });
-      } catch (err) { console.error('Error loading practice interviews:', err); }
-
-      // 5. Bot interviews (FRIEDE AI Interview)
-      try {
-        const botInt = await getBotInterviewHistory(user.id);
-        botInt.forEach(r => {
-          activities.push({
-            id: r.id,
-            type: 'bot-interview',
-            label: 'AI Interview (FRIEDE)',
-            roleName: r.role || 'Unknown Role',
-            date: r.completedAt || '',
-            score: r.feedback?.overallScore ?? null,
-            scoreMax: 10,
-          });
-        });
-      } catch (err) { console.error('Error loading bot interviews:', err); }
-
-      // Sort all activities by date descending
-      activities.sort((a, b) => {
-        const da = a.date ? new Date(a.date).getTime() : 0;
-        const db = b.date ? new Date(b.date).getTime() : 0;
-        return db - da;
+    // 1. Formal interviews (Round 2 / practice interviews saved via InterviewContext)
+    interviews.filter(i => i.completed).forEach(i => {
+      activities.push({
+        id: i.id,
+        type: 'interview',
+        label: i.isPracticeMode ? 'Practice Interview' : 'Mock Interview (Round 2)',
+        roleName: i.roleName || 'Unknown Role',
+        date: i.date || i.startTime || i.endTime || '',
+        score: i.score ?? null,
+        scoreMax: 10,
       });
+    });
 
-      setAllActivities(activities);
+    // 2. Round 1 Aptitude results (from mock interview flow)
+    round1Results.forEach(r => {
+      activities.push({
+        id: r.id,
+        type: 'round1',
+        label: r.aborted ? 'Round 1 Aptitude (Aborted)' : 'Round 1 Aptitude',
+        roleName: r.roleName || 'Unknown Role',
+        date: r.completedAt || '',
+        score: r.aborted ? null : (r.score ?? null),
+        scoreMax: 100,
+        status: r.aborted ? 'aborted' : r.selectedForRound2 ? 'selected' : 'under-review',
+      });
+    });
 
-      // Load market data (with fallback)
-      try {
-        const newsData = await newsApi.search('technology career jobs');
-        setNews(newsData.articles || []);
-      } catch { }
+    // 3. Practice aptitude
+    practiceAptitude.forEach(r => {
+      activities.push({
+        id: r.id,
+        type: 'practice-aptitude',
+        label: 'Practice Aptitude',
+        roleName: 'Aptitude Test',
+        date: r.completedAt || '',
+        score: r.score ?? null,
+        scoreMax: 100,
+      });
+    });
 
-      try {
-        const rates = await exchangeApi.getRates();
-        setExchangeRates(rates);
-      } catch { }
+    // 4. Practice interviews (from Practice Hub)
+    practiceInterviews.forEach(r => {
+      activities.push({
+        id: r.id,
+        type: 'practice-interview',
+        label: 'Practice Interview',
+        roleName: r.roleName || 'Unknown Role',
+        date: r.completedAt || '',
+        score: r.overallScore ?? null,
+        scoreMax: 10,
+      });
+    });
 
-      setLoading(false);
-    };
-    loadData();
-  }, [user]);
+    // 5. Bot interviews (FRIEDE AI Interview)
+    botInterviews.forEach(r => {
+      activities.push({
+        id: r.id,
+        type: 'bot-interview',
+        label: 'AI Interview (FRIEDE)',
+        roleName: r.role || 'Unknown Role',
+        date: r.completedAt || '',
+        score: r.feedback?.overallScore ?? null,
+        scoreMax: 10,
+      });
+    });
 
+    // Sort all activities by date descending
+    activities.sort((a, b) => {
+      const da = a.date ? new Date(a.date).getTime() : 0;
+      const db = b.date ? new Date(b.date).getTime() : 0;
+      return db - da;
+    });
+
+    return activities;
+  }, [interviews, round1Results, practiceAptitude, practiceInterviews, botInterviews]);
+
+  // Compute statistics from cached data
   const totalActivities = allActivities.length;
   const scoredActivities = allActivities.filter(a => a.score !== null);
   // Normalise all scores to 0-100 for a unified average

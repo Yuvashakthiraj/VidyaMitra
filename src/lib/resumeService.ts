@@ -2,8 +2,23 @@
  * Resume Service - Replaces Firebase-based resume storage
  */
 
-import { resumesApi } from './api';
+import { resumesApi, s3Api } from './api';
 import { ParsedResume } from '@/utils/resumeParser';
+
+/**
+ * Upload the actual PDF file to S3 for permanent storage.
+ * Returns the S3 key if successful, null otherwise.
+ */
+export const uploadResumeToS3 = async (file: File): Promise<string | null> => {
+  try {
+    const result = await s3Api.uploadFile(file, 'resumes');
+    console.log('☁️ Resume uploaded to S3:', result.key);
+    return result.key;
+  } catch (error) {
+    console.error('❌ Failed to upload resume to S3:', error);
+    return null;
+  }
+};
 
 export const saveResumeToFirestore = async (
   userId: string,

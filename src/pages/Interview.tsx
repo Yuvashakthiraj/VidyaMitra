@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import Layout from "@/components/Layout";
-import WebcamPanel from "@/components/WebcamPanel";
+import WebcamPanel, { type WebcamPanelHandle } from "@/components/WebcamPanel";
 import ProctoringBanner from "@/components/ProctoringBanner";
 import { useInterview } from "@/contexts/InterviewContext";
 import InterviewProgress from "@/components/InterviewProgress";
@@ -18,6 +18,7 @@ import { Label } from "@/components/ui/label";
 import { Clock, CheckCircle, Maximize, Minimize, Video } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
 import type { FaceViolation } from "@/hooks/useFaceDetection";
+import { useBehaviorProctor } from "@/hooks/useBehaviorProctor";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -55,6 +56,13 @@ const Interview = () => {
   
   // Track if the interview is active
   const interviewActive = useRef(true);
+  // Ref to WebcamPanel so behavioral violations feed into the unified 2-strike counter
+  const webcamPanelRef = useRef<WebcamPanelHandle>(null);
+
+  // Behavioral proctoring (right-click, copy/paste, split-screen, devtools)
+  const { latestEvent: behaviorEvent, clearEvent: clearBehaviorEvent } = useBehaviorProctor({
+    enabled: !showRules && !!currentInterview && !currentInterview.completed,
+  });
   
   // Redirect if no interview is in progress
   useEffect(() => {
@@ -89,94 +97,64 @@ const Interview = () => {
       }
     };
 
-    // Monitor window focus changes
-    const handleFocusChange = () => {
-      if (!document.hasFocus() && interviewActive.current && currentInterview && !currentInterview.completed) {
-        interviewActive.current = false;
-        setShowAbortDialog(true);
-      }
-    };
-    
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('beforeunload', handleBeforeUnload);
-    window.addEventListener('blur', handleFocusChange);
-    
-    // Check for window resizing which might indicate split-screen
-    let lastWidth = window.innerWidth;
-    let lastHeight = window.innerHeight;
-    
-    const handleResize = () => {
-      const widthChange = Math.abs(window.innerWidth - lastWidth);
-      const heightChange = Math.abs(window.innerHeight - lastHeight);
-      
-      // If significant resize occurs (might be split-screen)
-      if ((widthChange > 200 || heightChange > 200) && 
-          interviewActive.current && 
-          currentInterview && 
-          !currentInterview.completed) {
-        interviewActive.current = false;
-        setShowAbortDialog(true);
-      }
-      
-      lastWidth = window.innerWidth;
-      lastHeight = window.innerHeight;
-    };
-    
-    window.addEventListener('resize', handleResize);
-    
+    // Note: window.blur removed — causes false positives (clicking video elements, scrollbars etc.).
+    // Split-screen / resize is handled by useBehaviorProctor with 2-strike system.
+
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('beforeunload', handleBeforeUnload);
-      window.removeEventListener('blur', handleFocusChange);
-      window.removeEventListener('resize', handleResize);
     };
   }, [currentInterview, abortInterview, showRules]);
+
+  // Handle behavioral violations — route into the SAME unified 2-strike counter as face/object
+  useEffect(() => {
+    if (!behaviorEvent || !interviewActive.current || !currentInterview || currentInterview.completed) return;
+    clearBehaviorEvent();
+    // Let WebcamPanel's handleGlobalStrike do the counting (shared with face/object violations)
+    webcamPanelRef.current?.triggerBehaviorStrike(behaviorEvent.type, behaviorEvent.message);
+  }, [behaviorEvent, currentInterview, clearBehaviorEvent]);
   
   // Handle interview abort
   const handleAbortInterview = () => {
     if (currentInterview) {
-      abortInterview(currentInterview.id, abortReason || "User switched tabs, split-screen, or exited interview");
+      const reason = abortReason || 'Interview aborted due to proctoring violation';
+      abortInterview(currentInterview.id, reason);
+      // Fire-and-forget: log violation for admin dashboard
+      fetch('/api/proctor/violation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interviewId: currentInterview.id, reason, strikeCount: 2 }),
+      }).catch(() => {});
       setShowAbortDialog(false);
-      navigate("/practice");
-      
+      navigate('/practice');
       toast({
-        title: "Interview Aborted",
-        description: abortReason || "Your interview was aborted due to external tab/split-screen usage.",
-        variant: "destructive",
+        title: 'Interview Aborted',
+        description: reason,
+        variant: 'destructive',
       });
     }
   };
 
-  // Handle face proctoring — 1st strike = warning toast + banner
+  // Handle face/object/behavior proctoring — 1st strike = warning toast + banner
   const handleFaceWarning = useCallback((violation: FaceViolation) => {
     setBannerStrikeCount(1);
     setBannerViolation(violation);
-    const desc =
-      violation.type === 'multiple_faces'
-        ? 'Multiple faces detected in your camera. Next violation will abort the interview!'
-        : violation.type === 'prohibited_object'
-        ? 'Prohibited object (phone/book) detected! Remove it immediately. Next violation will abort!'
-        : 'No face detected for too long. Please stay in frame. Next violation will abort!';
     toast({
       title: "⚠️ Proctoring Warning (Strike 1/2)",
-      description: desc,
+      description: violation.message,
       variant: "destructive",
     });
   }, [toast]);
 
-  // Handle face proctoring — 2nd strike = abort + banner
+  // Handle face/object/behavior proctoring — 2nd strike = abort + banner
   const handleFaceViolation = useCallback((violation: FaceViolation) => {
     if (!interviewActive.current) return;
     interviewActive.current = false;
     setBannerStrikeCount(2);
     setBannerViolation(violation);
-    const reason =
-      violation.type === 'multiple_faces'
-        ? 'Strike 2: Another person detected in frame again. Interview aborted.'
-        : violation.type === 'prohibited_object'
-        ? 'Strike 2: Prohibited object detected again. Interview aborted.'
-        : 'Strike 2: Face not detected for too long again. Interview aborted.';
-    setAbortReason(reason);
+    setAbortReason(violation.message);
     setShowAbortDialog(true);
   }, []);
   
@@ -308,7 +286,7 @@ const Interview = () => {
             Interview Monitoring
           </div>
           <div className="h-40">
-            <WebcamPanel onViolation={handleFaceViolation} onWarning={handleFaceWarning} />
+            <WebcamPanel ref={webcamPanelRef} onViolation={handleFaceViolation} onWarning={handleFaceWarning} />
           </div>
         </div>
 

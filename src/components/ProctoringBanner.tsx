@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from 'react';
-import { ShieldAlert, ShieldX, AlertTriangle, Smartphone, Eye, Users, X } from 'lucide-react';
+import { ShieldAlert, ShieldX, AlertTriangle, Smartphone, Eye, Users, X, Mouse, Monitor, Copy, Clipboard, Terminal, ExternalLink } from 'lucide-react';
 import { type FaceViolation } from '@/hooks/useFaceDetection';
 
 interface ProctoringBannerProps {
@@ -10,10 +10,78 @@ interface ProctoringBannerProps {
 }
 
 const ICON_MAP: Record<string, typeof AlertTriangle> = {
-  no_face: Eye,
-  multiple_faces: Users,
+  no_face:           Eye,
+  multiple_faces:    Users,
   prohibited_object: Smartphone,
+  right_click:       Mouse,
+  split_screen:      Monitor,
+  copy_attempt:      Copy,
+  paste_attempt:     Clipboard,
+  devtools_attempt:  Terminal,
+  tab_switch:        ExternalLink,
 };
+
+/** Extract the specific object name from a prohibited_object violation message */
+function extractObjectNames(message: string): string {
+  const match = message.match(/Prohibited object detected:\s*([^—\n]+)/i);
+  return match ? match[1].trim() : 'Prohibited object';
+}
+
+/** Get the human-readable reason for the violation (without strike prefix/suffix) */
+function getViolationDetail(violation: FaceViolation, isFatal: boolean): string {
+  const type = violation.type;
+  if (type === 'no_face') {
+    return isFatal
+      ? 'Face not visible twice. Your session has been terminated.'
+      : 'Your face is not visible. Return to frame immediately or your session will be aborted!';
+  }
+  if (type === 'multiple_faces') {
+    return isFatal
+      ? 'Multiple people detected again. Your session has been terminated.'
+      : 'Another person is visible in your camera! Remove them immediately — next offense aborts the session.';
+  }
+  if (type === 'prohibited_object') {
+    const obj = extractObjectNames(violation.message);
+    return isFatal
+      ? `${obj} detected again. Your session has been terminated.`
+      : `${obj} detected in frame! Remove it immediately — next offense aborts the session.`;
+  }
+  if (type === 'right_click') {
+    return isFatal
+      ? 'Right-clicking detected again. Your session has been terminated.'
+      : 'Right-clicking is not allowed during the session. Next offense will abort it.';
+  }
+  if (type === 'split_screen') {
+    return isFatal
+      ? 'Split-screen detected again. Your session has been terminated.'
+      : 'Split-screen is not allowed. Use a full-size window — next offense will abort the session.';
+  }
+  if (type === 'copy_attempt') {
+    return isFatal
+      ? 'Copying content detected again. Your session has been terminated.'
+      : 'Copying content is not allowed during the session. Next offense will abort it.';
+  }
+  if (type === 'paste_attempt') {
+    return isFatal
+      ? 'Pasting content detected again. Your session has been terminated.'
+      : 'Pasting is not allowed during the session. Next offense will abort it.';
+  }
+  if (type === 'devtools_attempt') {
+    return isFatal
+      ? 'Developer tools detected again. Your session has been terminated.'
+      : 'Opening developer tools is not allowed. Next offense will abort the session.';
+  }
+  if (type === 'tab_switch') {
+    return isFatal
+      ? 'Tab switching detected again. Your session has been terminated.'
+      : 'Switching tabs or windows is not allowed. Next offense will abort the session.';
+  }
+  // Generic fallback — use the raw message detail
+  const cleaned = violation.message
+    .replace(/^[^\w]*(Strike \d+:\s*)?/i, '')
+    .replace(/\s*—\s*(Next violation.*|Interview aborted.*)$/i, '');
+  return cleaned || 'A proctoring violation was detected.';
+}
 
 /**
  * A full-width, attention-grabbing banner that overlays the top of the screen
@@ -127,20 +195,7 @@ export default function ProctoringBanner({ violation, strikeCount }: ProctoringB
               </div>
               <div className="flex items-center gap-2 mt-1 text-white/90 text-sm md:text-base">
                 <ViolationIcon className="h-4 w-4 flex-shrink-0" />
-                <span>
-                  {currentViolation.type === 'no_face' &&
-                    (isFatal
-                      ? 'Face not detected for too long — twice. Your session has been terminated.'
-                      : 'Your face is not visible. Return to frame immediately or your session will be aborted!')}
-                  {currentViolation.type === 'multiple_faces' &&
-                    (isFatal
-                      ? 'Multiple people detected again. Your session has been terminated.'
-                      : 'Another person is visible in your camera! Remove them immediately — next offense aborts the session.')}
-                  {currentViolation.type === 'prohibited_object' &&
-                    (isFatal
-                      ? 'Prohibited object detected again. Your session has been terminated.'
-                      : 'Phone, book, or other prohibited object detected! Remove it now — next offense aborts the session.')}
-                </span>
+                <span>{getViolationDetail(currentViolation, isFatal)}</span>
               </div>
             </div>
 

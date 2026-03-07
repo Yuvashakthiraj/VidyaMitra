@@ -3,12 +3,13 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 // ─── Types ────────────────────────────────────────────────────
 export type ProctorStatus = 'loading' | 'ok' | 'warning' | 'violation';
 
+
 export interface FaceViolation {
-  type: 'no_face' | 'multiple_faces' | 'prohibited_object';
+  type: 'no_face' | 'multiple_faces' | 'prohibited_object' | 'right_click' | 'split_screen' | 'copy_attempt' | 'paste_attempt' | 'devtools_attempt' | 'tab_switch';
   message: string;
   timestamp: number;
-  snapshot?: string; // base64 data-url of the frame
-  /** true = final strike, abort the interview */
+  snapshot?: string;
+  /** true = 2nd strike, abort the interview */
   isFatal: boolean;
 }
 
@@ -39,7 +40,7 @@ const CLASS_DISPLAY_NAMES: Record<string, string> = {
 export interface UseFaceDetectionOptions {
   /** How often (ms) to run detection. Lower = more responsive but heavier. Default 1500 */
   intervalMs?: number;
-  /** Seconds of 0-face before a strike is counted. Default 7 */
+  /** Seconds of 0-face before a strike is counted. Default 5 */
   noFaceStrikeSec?: number;
   /** Whether detection is active */
   enabled?: boolean;
@@ -103,7 +104,7 @@ export function useFaceDetection(
 ): UseFaceDetectionReturn {
   const {
     intervalMs = 1500,
-    noFaceStrikeSec = 7,
+    noFaceStrikeSec = 5,
     enabled = true,
     objectDetection = true,
   } = options;
@@ -177,15 +178,16 @@ export function useFaceDetection(
 
       setWarningCount(count);
       pushViolation(v);
+      // Always reset the no-face timer after any strike so the loop doesn't
+      // immediately re-fire on the very next cycle.
+      noFaceStart.current = null;
 
       if (isFatal) {
         setStatus('violation');
         setStatusMessage(v.message);
-        aborted.current = true;
       } else {
         setStatus('warning');
         setStatusMessage(v.message);
-        noFaceStart.current = null;
       }
 
       return isFatal;
@@ -236,42 +238,29 @@ export function useFaceDetection(
         cycleCount.current += 1;
 
         try {
-          // ── 1) Face detection (every cycle) ─────────────
+          // ── Run face detection and object detection in parallel ──────
+          // Running both simultaneously prevents the race where a phone screen
+          // is detected as a face before COCO-SSD has a chance to identify it
+          // as a prohibited object, which would incorrectly fire 'multiple_faces'.
           const faceModel = await ensureBlazeFaceLoaded();
-          const facePreds = await faceModel.estimateFaces(video, false);
+          const objModel = objectDetection && cocoSsdModel ? cocoSsdModel : null;
+
+          const [facePreds, rawObjPreds] = await Promise.all([
+            faceModel.estimateFaces(video, false),
+            objModel ? (objModel.detect(video) as Promise<any[]>) : Promise.resolve([] as any[]),
+          ]);
           if (cancelled || aborted.current) return;
 
           const count = facePreds.length;
           setFaceCount(count);
 
-          if (count >= 2) {
-            recordStrike('multiple_faces', `${count} faces detected — another person in frame`);
-            return;
-          }
-
-          if (count === 0) {
-            if (noFaceStart.current === null) {
-              noFaceStart.current = Date.now();
-            }
-            const elapsed = (Date.now() - noFaceStart.current) / 1000;
-            if (elapsed >= noFaceStrikeSec) {
-              recordStrike('no_face', 'No face detected for too long');
-              return;
-            }
-            setStatus('ok');
-            setStatusMessage(`Face not detected (${Math.round(elapsed)}s) — stay in frame`);
-            // Don't return — still run object detection below
-          } else {
-            noFaceStart.current = null;
-          }
-
-          // ── 2) Object detection (every cycle) ──────────
+          // ── 1) Object detection — checked BEFORE multiple-faces ──────
+          // This ensures that a phone's bright screen or face-like pattern
+          // does not trigger a false 'multiple_faces' violation instead of
+          // the correct 'prohibited_object' one.
+          let prohibitedPending = false;
           if (objectDetection && cocoSsdModel) {
-            const objPreds = await cocoSsdModel.detect(video);
-            if (cancelled || aborted.current) return;
-
-            // Per-class threshold filtering
-            const prohibited = objPreds
+            const prohibited: DetectedObject[] = rawObjPreds
               .filter((p: any) => {
                 const threshold = PROHIBITED_OBJECT_THRESHOLDS[p.class];
                 return threshold !== undefined && p.score >= threshold;
@@ -284,23 +273,50 @@ export function useFaceDetection(
             setDetectedObjects(prohibited);
 
             if (prohibited.length > 0) {
-              // Multi-frame confirmation — need CONSECUTIVE_HITS_NEEDED in a row
+              prohibitedPending = true;
               consecutiveObjectHits.current += 1;
 
               if (consecutiveObjectHits.current >= CONSECUTIVE_HITS_NEEDED) {
-                const names = [...new Set(prohibited.map((p: DetectedObject) => p.class))].join(', ');
                 consecutiveObjectHits.current = 0;
+                const names = [...new Set(prohibited.map((p) => p.class))].join(', ');
                 recordStrike('prohibited_object', `Prohibited object detected: ${names}`);
                 return;
               }
+
+              // Accumulating hits: show a pending warning in the webcam overlay
+              const names = [...new Set(prohibited.map((p) => p.class))].join(', ');
+              setStatus('warning');
+              setStatusMessage(`⚠️ ${names} in frame — remove immediately`);
             } else {
-              // Reset if this cycle was clean
               consecutiveObjectHits.current = 0;
             }
           }
 
-          // ── All clear ───────────────────────────────────
-          if (count === 1) {
+          // ── 2) Multiple-face check ───────────────────────────────────
+          // Suppressed when a prohibited object is pending — the phone's
+          // bright screen or pattern may be what BlazeFace is counting as a
+          // second face. The object violation will fire on the next cycle.
+          if (count >= 2 && !prohibitedPending) {
+            recordStrike('multiple_faces', `${count} faces detected — another person in frame`);
+            return;
+          }
+
+          // ── 3) No-face check ─────────────────────────────────────────
+          if (count === 0) {
+            if (noFaceStart.current === null) noFaceStart.current = Date.now();
+            const elapsed = (Date.now() - noFaceStart.current) / 1000;
+            if (elapsed >= noFaceStrikeSec) {
+              recordStrike('no_face', 'No face detected for too long');
+              return;
+            }
+            setStatus('ok');
+            setStatusMessage(`Face not detected (${Math.round(elapsed)}s) — stay in frame`);
+          } else {
+            noFaceStart.current = null;
+          }
+
+          // ── 4) All clear ─────────────────────────────────────────────
+          if (count >= 1 && !prohibitedPending) {
             if (strikeCount.current === 0) {
               setStatus('ok');
               setStatusMessage('Proctoring active ✓');

@@ -149,7 +149,37 @@ const roleRequirements: Record<string, {
   }
 };
 
-// Extract text from PDF
+/**
+ * Extract resume text via AWS Textract (Lambda).
+ * Requires the file to already be uploaded to S3 and its key known.
+ * Throws if the server returns an error so the caller can fall back to PDF.js.
+ */
+export const extractTextViaTextract = async (s3Key: string): Promise<string> => {
+  const token = localStorage.getItem('vidyamitra_token');
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch('/api/resume/extract', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      bucket: import.meta.env.VITE_S3_BUCKET_NAME || 'vidyamitra-uploads-629496',
+      key: s3Key,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({})) as any;
+    throw new Error(err.error ?? `Textract request failed (${res.status})`);
+  }
+
+  const data = await res.json() as { text: string };
+  const text = data.text ?? '';
+  if (!text.trim()) throw new Error('Textract returned empty text');
+  return text;
+};
+
+// Extract text from PDF (client-side fallback using PDF.js)
 export const extractTextFromPDF = async (file: File): Promise<string> => {
   try {
     const arrayBuffer = await file.arrayBuffer();
@@ -507,6 +537,86 @@ export const processResume = async (
       
       return {
         fileName: file.name,
+        uploadDate: new Date().toISOString(),
+        parsedData,
+        atsScore: score,
+        atsAnalysis: analysis
+      };
+    } catch (fallbackError) {
+      console.error('❌ Fallback parsing also failed:', fallbackError);
+      throw new Error('Failed to process resume. Please try again or contact support.');
+    }
+  }
+};
+
+// Process resume from pre-extracted text (no PDF parsing needed)
+export const processResumeFromText = async (
+  text: string,
+  fileName: string,
+  roleId: string
+): Promise<ResumeData> => {
+  console.log(`🔍 Processing resume from text for role: ${roleId} (${text.length} chars)`);
+
+  const roleMap: Record<string, string> = {
+    'software-engineer': 'Software Engineer',
+    'data-scientist': 'Data Scientist',
+    'product-manager': 'Product Manager',
+    'ux-designer': 'UX Designer',
+    'marketing-manager': 'Marketing Manager',
+    'sales-representative': 'Sales Representative',
+    'hr-manager': 'HR Manager',
+    'cloud-engineer': 'Cloud Engineer',
+    'cybersecurity-analyst': 'Cybersecurity Analyst',
+    'business-analyst': 'Business Analyst',
+    'devops-engineer': 'DevOps Engineer',
+    'full-stack-developer': 'Full Stack Developer',
+    'mobile-app-developer': 'Mobile App Developer',
+    'ai-ml-research-scientist': 'AI/ML Research Scientist'
+  };
+  const targetRole = roleMap[roleId] || roleId.replace(/-/g, ' ');
+
+  try {
+    console.log(`🤖 Attempting AI analysis with Gemini for role: ${targetRole}`);
+    const aiAnalysis = await analyzeResumeWithAI(text, targetRole);
+    console.log(`✅ AI analysis successful - Score: ${aiAnalysis.ats_match_score}`);
+
+    const parsedData: ResumeData['parsedData'] = {
+      name: extractNameFromText(text),
+      email: extractEmailFromText(text),
+      phone: extractPhoneFromText(text),
+      skills: [
+        ...aiAnalysis.skills_extracted.technical_skills,
+        ...aiAnalysis.skills_extracted.soft_skills,
+        ...aiAnalysis.skills_extracted.tools_and_technologies
+      ],
+      experience: aiAnalysis.experience.project_summary,
+      education: aiAnalysis.education,
+      certifications: aiAnalysis.achievements,
+      totalExperienceYears: aiAnalysis.experience.total_years
+    };
+
+    const atsAnalysis: ResumeData['atsAnalysis'] = {
+      matchedSkills: aiAnalysis.role_specific_analysis.matched_skills,
+      missingSkills: aiAnalysis.role_specific_analysis.unmatched_skills,
+      experienceMatch: Math.min(100, (aiAnalysis.experience.relevant_experience_years / 2) * 100),
+      educationMatch: aiAnalysis.education.length > 0 ? 90 : 50,
+      overallMatch: aiAnalysis.role_specific_analysis.match_percentage
+    };
+
+    return {
+      fileName,
+      uploadDate: new Date().toISOString(),
+      parsedData,
+      atsScore: aiAnalysis.ats_match_score,
+      atsAnalysis
+    };
+  } catch (aiError) {
+    console.warn('⚠️ AI analysis failed, using fallback parsing:', (aiError as any)?.message || aiError);
+    try {
+      const parsedData = parseResumeText(text);
+      const { score, analysis } = calculateATSScore(parsedData, roleId);
+      return {
+        fileName,
         uploadDate: new Date().toISOString(),
         parsedData,
         atsScore: score,

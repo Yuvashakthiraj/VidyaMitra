@@ -1,20 +1,21 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
-import { Upload, FileText, CheckCircle, XCircle, AlertCircle, Trophy } from "lucide-react";
-import { processResume } from "@/utils/atsParser";
+import { Upload, FileText, CheckCircle, XCircle, AlertCircle, Trophy, UserCircle } from "lucide-react";
+import { processResume, processResumeFromText, extractTextViaTextract } from "@/utils/atsParser";
 import { ResumeData } from "@/types";
 import { toast } from "sonner";
-import { analyzeResumeForAllRoles, RoleMatchResult, getConfidenceBadgeVariant } from "@/utils/intelligentRoleDetection";
+import { analyzeResumeForAllRoles, analyzeResumeForAllRolesFromText, RoleMatchResult, getConfidenceBadgeVariant } from "@/utils/intelligentRoleDetection";
 import LearningRecommendations from "@/components/LearningRecommendations";
 import { generateResumeSkillGaps } from "@/utils/learningRecommendations";
-import { saveResumeToFirestore } from "@/lib/resumeService";
+import { saveResumeToFirestore, uploadResumeToS3 } from "@/lib/resumeService";
 import { parseResumeFile } from "@/utils/resumeParser";
 import { useAuth } from "@/contexts/AuthContext";
+import { loadResumeFromProfile, saveResumeToProfile, logActivity, type SavedResume } from "@/utils/profileService";
 
 interface ResumeUploadProps {
   roleId?: string;
@@ -31,6 +32,51 @@ export const ResumeUpload = ({ roleId, onResumeProcessed, minimumScore = 60, sho
   const [topMatches, setTopMatches] = useState<RoleMatchResult[]>([]);
   const [error, setError] = useState<string>("");
   const [skillGapAnalysis, setSkillGapAnalysis] = useState(null);
+  const [profileResume, setProfileResume] = useState<SavedResume | null>(null);
+  const [loadingProfile, setLoadingProfile] = useState(false);
+  const [textractUsed, setTextractUsed] = useState(false);
+
+  // Check for saved resume on mount
+  useEffect(() => {
+    loadResumeFromProfile().then(r => setProfileResume(r)).catch(() => {});
+  }, []);
+
+  const handleLoadFromProfile = async () => {
+    if (!profileResume) return;
+    setLoadingProfile(true);
+    setError('');
+    toast.success('Loading resume from profile...', { duration: 1500 });
+    try {
+      const resumeText = profileResume.text || '';
+      const resumeName = profileResume.name || 'profile-resume.pdf';
+
+      if (showBestMatch) {
+        // Use text-based analysis — no PDF parsing needed
+        const matches = await analyzeResumeForAllRolesFromText(resumeText);
+        setTopMatches(matches);
+        if (matches.length > 0) {
+          const bestMatchResume = await processResumeFromText(resumeText, resumeName, matches[0].roleId);
+          setResume(bestMatchResume);
+          toast.success(`Top match: ${matches[0].roleName} (${matches[0].score}%) - loaded from profile`);
+          onResumeProcessed?.(bestMatchResume);
+        }
+      } else if (roleId) {
+        const processedResume = await processResumeFromText(resumeText, resumeName, roleId);
+        setResume(processedResume);
+        if (processedResume.atsScore >= minimumScore) {
+          toast.success(`Resume scored ${processedResume.atsScore}% (loaded from profile)`);
+          onResumeProcessed?.(processedResume);
+        } else {
+          toast.error(`Resume scored ${processedResume.atsScore}%. Minimum required is ${minimumScore}%.`);
+        }
+      }
+      await logActivity('resume_analysis', 'Analyzed profile resume', `Role: ${roleId || 'Best Match'}`).catch(() => {});
+    } catch {
+      toast.error('Failed to process profile resume');
+    } finally {
+      setLoadingProfile(false);
+    }
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
@@ -68,10 +114,42 @@ export const ResumeUpload = ({ roleId, onResumeProcessed, minimumScore = 60, sho
     toast.success("AI is analyzing your resume...", { duration: 2000 });
 
     try {
+      // Upload to S3 first so Textract can access the file by S3 key
+      let s3Key: string | null = null;
+      try {
+        s3Key = await uploadResumeToS3(file);
+        if (s3Key) toast.success('Resume stored in cloud storage');
+      } catch (s3Err) {
+        // S3 upload failure is non-blocking — but show the error so user knows why Textract is skipped
+        const s3ErrMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
+        console.error('❌ S3 upload failed:', s3ErrMsg);
+        toast.error(`S3 upload failed: ${s3ErrMsg}`, { duration: 6000 });
+      }
+
+      // Try Textract (AWS Lambda) for higher-quality text extraction.
+      // Falls back to PDF.js automatically if Lambda is not yet configured.
+      let extractedText: string | null = null;
+      if (s3Key) {
+        try {
+          extractedText = await extractTextViaTextract(s3Key);
+          console.log('✅ Textract extraction successful');
+          setTextractUsed(true);
+          toast.success('⚡ AWS Textract extracted resume text', { duration: 3000 });
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error('⚠️ Textract unavailable, falling back to PDF.js:', errMsg);
+          toast.warning(`⚠️ Textract unavailable (${errMsg}) — using PDF.js fallback`, { duration: 5000 });
+        }
+      } else {
+        console.warn('⚠️ S3 upload failed — skipping Textract, will use PDF.js');
+      }
+
       if (showBestMatch) {
         // Intelligent role detection - analyze against all roles
         console.log("📊 Mode: Analyzing against all roles for best match");
-        const matches = await analyzeResumeForAllRoles(file);
+        const matches = extractedText
+          ? await (await import('@/utils/intelligentRoleDetection')).analyzeResumeForAllRolesFromText(extractedText)
+          : await analyzeResumeForAllRoles(file);
         
         console.log(`✅ Found ${matches.length} role matches`);
         setTopMatches(matches);
@@ -79,7 +157,9 @@ export const ResumeUpload = ({ roleId, onResumeProcessed, minimumScore = 60, sho
         if (matches.length > 0) {
           // Use the best match for displaying resume details
           console.log(`🎯 Best match: ${matches[0].roleName} (${matches[0].score}%)`);
-          const bestMatchResume = await processResume(file, matches[0].roleId);
+          const bestMatchResume = extractedText
+            ? await processResumeFromText(extractedText, file.name, matches[0].roleId)
+            : await processResume(file, matches[0].roleId);
           setResume(bestMatchResume);
           toast.success(`Top match: ${matches[0].roleName} (${matches[0].score}% - ${matches[0].confidenceLevel})`);
         } else {
@@ -89,14 +169,16 @@ export const ResumeUpload = ({ roleId, onResumeProcessed, minimumScore = 60, sho
       } else if (roleId) {
         // Analyze against specific role
         console.log("📊 Mode: Processing resume for specific role:", roleId);
-        const processedResume = await processResume(file, roleId);
+        const processedResume = extractedText
+          ? await processResumeFromText(extractedText, file.name, roleId)
+          : await processResume(file, roleId);
         console.log("✅ Resume processing completed:", {
           score: processedResume.atsScore,
           matchedSkills: processedResume.atsAnalysis.matchedSkills.length,
           missingSkills: processedResume.atsAnalysis.missingSkills.length,
           fileName: processedResume.fileName
         });
-        
+
         // Save resume to Firestore
         if (user) {
           try {
@@ -134,6 +216,22 @@ export const ResumeUpload = ({ roleId, onResumeProcessed, minimumScore = 60, sho
             console.error('❌ Failed to save resume to Firestore:', saveError);
             // Don't block the flow if saving fails
           }
+
+          // Also save to profile system
+          try {
+            const allSkills = [
+              ...(processedResume.atsAnalysis?.matchedSkills || []),
+              ...(processedResume.parsedData?.skills || [])
+            ].filter(Boolean);
+            await saveResumeToProfile({
+              name: file.name,
+              text: processedResume.parsedData?.skills?.join(', ') || file.name,
+              skills: allSkills,
+              ats_score: processedResume.atsScore,
+            });
+            setProfileResume({ name: file.name, text: '', skills: allSkills, ats_score: processedResume.atsScore });
+            await logActivity('resume_upload', 'Uploaded resume', `File: ${file.name}, Score: ${processedResume.atsScore}%`).catch(() => {});
+          } catch { /* silent profile save */ }
         }
         
         setResume(processedResume);
@@ -256,6 +354,18 @@ export const ResumeUpload = ({ roleId, onResumeProcessed, minimumScore = 60, sho
               <FileText className="h-3 w-3" />
               📄 Supported format: PDF only • Max size: 5MB
             </p>
+
+            {profileResume && (
+              <div className="flex items-center gap-3 p-3 rounded-lg bg-green-50 border border-green-200">
+                <UserCircle className="h-5 w-5 text-green-600 shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-green-900">Saved resume: <span className="text-green-700">{profileResume.name}</span></p>
+                </div>
+                <Button variant="outline" size="sm" onClick={handleLoadFromProfile} disabled={loadingProfile} className="border-green-300 text-green-700 hover:bg-green-100">
+                  {loadingProfile ? 'Loading...' : 'Load from Profile'}
+                </Button>
+              </div>
+            )}
           </div>
 
           {error && (
@@ -347,7 +457,14 @@ export const ResumeUpload = ({ roleId, onResumeProcessed, minimumScore = 60, sho
             <div className="space-y-4 p-4 border rounded-lg bg-muted/50">
               <div className="flex items-center justify-between">
                 <h3 className="font-semibold text-lg">ATS Analysis Results</h3>
-                {getScoreBadge(resume.atsScore)}
+                <div className="flex items-center gap-2">
+                  {textractUsed && (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-orange-100 text-orange-700 border border-orange-300">
+                      ⚡ Powered by AWS Textract
+                    </span>
+                  )}
+                  {getScoreBadge(resume.atsScore)}
+                </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

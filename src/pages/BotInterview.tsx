@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import { BotInterviewProvider, useBotInterview } from '../contexts/BotInterviewContext';
 import { friedeService, InterviewContext } from '../utils/friedeService';
 import { voiceService, VoiceService } from '../utils/voiceService';
-import PreInterviewFlow from '../components/PreInterviewFlow';
+import PreInterviewFlow, { InterviewMode } from '../components/PreInterviewFlow';
+import ElevenLabsInterview from '../components/ElevenLabsInterview';
 import FriedeAvatar from '../components/FriedeAvatar';
 import WebcamPanel from '../components/WebcamPanel';
 import TranscriptionPanel from '../components/TranscriptionPanel';
@@ -12,6 +13,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../co
 import { MessageSquare, Loader2, CheckCircle } from 'lucide-react';
 import { saveBotInterviewResult } from '../lib/firebaseService';
 import { useAuth } from '../contexts/AuthContext';
+import { logActivity } from '../utils/profileService';
 
 function BotInterviewContent() {
   const navigate = useNavigate();
@@ -30,6 +32,14 @@ function BotInterviewContent() {
 
   const [isInitializing, setIsInitializing] = useState(false);
   const [error, setError] = useState<string>('');
+  
+  // ElevenLabs mode state
+  const [interviewMode, setInterviewMode] = useState<InterviewMode>('friede');
+  const [elevenLabsInfo, setElevenLabsInfo] = useState<{
+    name: string;
+    role: string;
+    isFirstTime: boolean;
+  } | null>(null);
 
   // Use refs to avoid circular dependencies and stale closures
   const friedeContextRef = useRef<InterviewContext | null>(null);
@@ -181,6 +191,14 @@ setFriedeSpeaking(false);
       // Update phase to completed - this will show the feedback screen
       updatePhase('completed');
 
+      // Log to profile activity
+      logActivity(
+        'bot_interview',
+        'AI Interview Completed',
+        `Role: ${state.role}, Candidate: ${state.candidateName}`,
+        { role: state.role, candidateName: state.candidateName, questionsAnswered: state.conversationLog.length }
+      ).catch(() => {});
+
     } catch (err) {
       console.error('❌ Error completing interview:', err);
       setError('Failed to generate feedback. Please try again.');
@@ -226,7 +244,17 @@ setFriedeSpeaking(false);
   }, [addMessage, setListening, setFriedeSpeaking, handleCandidateAnswer]);
 
   // Initialize interview context
-  const initializeInterview = useCallback(async (name: string, role: string, isFirstTime: boolean) => {
+  const initializeInterview = useCallback(async (name: string, role: string, isFirstTime: boolean, mode?: InterviewMode) => {
+    // If ElevenLabs mode selected, switch to ElevenLabs component
+    if (mode === 'elevenlabs') {
+      setInterviewMode('elevenlabs');
+      setElevenLabsInfo({ name, role, isFirstTime });
+      setCandidateInfo(name, role, isFirstTime);
+      updatePhase('active');
+      return;
+    }
+
+    setInterviewMode('friede');
     setIsInitializing(true);
     setError('');
 
@@ -273,7 +301,7 @@ setFriedeSpeaking(false);
     } finally {
       setIsInitializing(false);
     }
-  }, [setCandidateInfo, updateFriedeContext, addMessage, updatePhase, setFriedeSpeaking, startListening]);
+  }, [setCandidateInfo, updateFriedeContext, addMessage, updatePhase, setFriedeSpeaking, startListening, setInterviewMode]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -285,6 +313,29 @@ setFriedeSpeaking(false);
   // Pre-interview flow
   if (state.phase === 'pre-interview') {
     return <PreInterviewFlow onComplete={initializeInterview} />;
+  }
+
+  // ElevenLabs Voice AI mode
+  if (interviewMode === 'elevenlabs' && elevenLabsInfo) {
+    return (
+      <ElevenLabsInterview
+        candidateName={elevenLabsInfo.name}
+        role={elevenLabsInfo.role}
+        isFirstTime={elevenLabsInfo.isFirstTime}
+        onFallbackToFriede={() => {
+          // Fall back to FRIEDE by re-initializing with friede mode
+          setInterviewMode('friede');
+          setElevenLabsInfo(null);
+          updatePhase('pre-interview');
+        }}
+        onComplete={() => {
+          // Reset for new interview
+          setInterviewMode('friede');
+          setElevenLabsInfo(null);
+          updatePhase('pre-interview');
+        }}
+      />
+    );
   }
 
   // Completed state

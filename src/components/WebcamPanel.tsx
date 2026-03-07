@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Video, VideoOff, ShieldCheck, ShieldAlert, ShieldX, Loader2 } from 'lucide-react';
+import { Video, VideoOff, ShieldCheck, ShieldAlert, ShieldX, Loader2, Smartphone } from 'lucide-react';
 import { Button } from './ui/button';
 import { useFaceDetection, type FaceViolation, type ProctorStatus } from '@/hooks/useFaceDetection';
-import { Smartphone } from 'lucide-react';
+import { useProctoringSettings } from '@/hooks/useProctoringSettings';
 
 interface WebcamPanelProps {
   onStreamReady?: (stream: MediaStream) => void;
-  /** Called only on the FATAL (2nd) violation — triggers abort in parent */
+  /** Called only on the FATAL (2nd) strike — triggers abort in parent */
   onViolation?: (violation: FaceViolation) => void;
   /** Called on the 1st warning strike (non-fatal) — parent can log it */
   onWarning?: (violation: FaceViolation) => void;
@@ -15,6 +15,8 @@ interface WebcamPanelProps {
   /** Enable object detection for phones/books. Defaults to true. */
   objectDetection?: boolean;
 }
+
+const STRIKE_COOLDOWN_MS = 2000;
 
 const STATUS_CONFIG: Record<ProctorStatus, { color: string; bg: string; icon: typeof ShieldCheck }> = {
   loading: { color: 'text-blue-300', bg: 'bg-blue-500/80', icon: Loader2 },
@@ -29,29 +31,75 @@ export default function WebcamPanel({ onStreamReady, onViolation, onWarning, pro
   const [error, setError] = useState<string>('');
   const [isVideoEnabled, setIsVideoEnabled] = useState(true);
 
+  // ── Unified strike system ──
+  const globalStrikes = useRef(0);
+  const lastStrikeTime = useRef(0);
+  const [strikeDisplay, setStrikeDisplay] = useState(0);
+
+  // ── Admin proctoring settings ──
+  const { settings } = useProctoringSettings();
+
   // ── Stable callback refs so the hook doesn't re-trigger ──
   const onViolationRef = useRef(onViolation);
   onViolationRef.current = onViolation;
   const onWarningRef = useRef(onWarning);
   onWarningRef.current = onWarning;
 
-  // ── Face detection hook ──────────────────────────────────
+  // Always enable TF proctoring when proctoring=true — do not gate on settings.tensorflow
+  // (DB may have tensorflow:false from when Rekognition was active).
+  const tfEnabled = proctoring && isVideoEnabled && !error;
+  const objEnabled = proctoring && settings.objectDetection && objectDetection;
+
+  // ── Client-side face detection (TF.js — every ~1.5s) ─────
   const { status, faceCount, violation, warningCount, statusMessage, detectedObjects } = useFaceDetection(videoRef, {
-    enabled: proctoring && isVideoEnabled && !error,
-    intervalMs: 1500,
-    noFaceStrikeSec: 7,
-    objectDetection: proctoring && objectDetection,
+    enabled: tfEnabled,
+    intervalMs: settings.tfIntervalMs,
+    noFaceStrikeSec: settings.noFaceStrikeSec,
+    objectDetection: objEnabled,
   });
 
-  // Forward violations to parent — only fatal ones trigger abort
+  /**
+   * Unified strike handler — TF.js feeds into this.
+   * 5-second cooldown between strikes to prevent rapid double-counting.
+   * 2 strikes = abort.
+   */
+  const handleGlobalStrike = useCallback((type: FaceViolation['type'], message: string) => {
+    const now = Date.now();
+    if (now - lastStrikeTime.current < STRIKE_COOLDOWN_MS) return;
+
+    lastStrikeTime.current = now;
+    globalStrikes.current += 1;
+    const count = globalStrikes.current;
+    setStrikeDisplay(count);
+
+    const isFatal = count >= 2;
+    const v: FaceViolation = {
+      type,
+      message: isFatal
+        ? `⛔ Strike ${count}: ${message} — Interview aborted!`
+        : `⚠️ Strike ${count}: ${message} — Next violation will abort!`,
+      timestamp: now,
+      isFatal,
+    };
+
+    if (isFatal) {
+      onViolationRef.current?.(v);
+    } else {
+      onWarningRef.current?.(v);
+    }
+  }, []);
+
+  // Forward TF.js violations to unified strike handler
   useEffect(() => {
     if (!violation) return;
-    if (violation.isFatal) {
-      onViolationRef.current?.(violation);
-    } else {
-      onWarningRef.current?.(violation);
-    }
-  }, [violation]);
+    // Strip the "⚠️ Strike N: " prefix and the trailing "— Next violation..." / "— Interview aborted!" suffix
+    // so handleGlobalStrike can wrap cleanly with its own formatting.
+    const detail = violation.message
+      .replace(/^[^\w]*(Strike \d+:\s*)?/i, '')
+      .replace(/\s*—\s*(Next violation.*|Interview aborted.*)$/i, '')
+      .trim();
+    handleGlobalStrike(violation.type, detail || violation.message);
+  }, [violation, handleGlobalStrike]);
 
   // ── Webcam start / stop ──────────────────────────────────
   useEffect(() => {
@@ -126,33 +174,35 @@ export default function WebcamPanel({ onStreamReady, onViolation, onWarning, pro
 
           {/* ── Proctor Status Badge (top-left) ── */}
           {proctoring && (
-            <div
-              className={`absolute top-2 left-2 flex items-center gap-1.5 ${cfg.bg} px-2 py-1 rounded-full transition-colors duration-300`}
-            >
-              <StatusIcon
-                className={`w-3 h-3 ${cfg.color} ${status === 'loading' ? 'animate-spin' : ''}`}
-              />
-              <span className="text-white text-[10px] font-medium leading-none max-w-[130px] truncate">
-                {statusMessage}
-              </span>
+            <div className="absolute top-2 left-2 flex flex-col gap-1">
+              <div
+                className={`flex items-center gap-1.5 ${cfg.bg} px-2 py-1 rounded-full transition-colors duration-300`}
+              >
+                <StatusIcon
+                  className={`w-3 h-3 ${cfg.color} ${status === 'loading' ? 'animate-spin' : ''}`}
+                />
+                <span className="text-white text-[10px] font-medium leading-none max-w-[130px] truncate">
+                  {statusMessage}
+                </span>
+              </div>
             </div>
           )}
 
           {/* ── Strike Counter + Face Count (top-right) ── */}
           <div className="absolute top-2 right-2 flex flex-col items-end gap-1">
-            {/* Strike counter */}
+            {/* Global strike counter */}
             {proctoring && (
               <div
                 className={`flex items-center gap-1 px-2 py-0.5 rounded-full ${
-                  warningCount >= 2
+                  strikeDisplay >= 2
                     ? 'bg-red-600/90'
-                    : warningCount === 1
+                    : strikeDisplay === 1
                     ? 'bg-yellow-500/80'
                     : 'bg-green-600/80'
                 }`}
               >
                 <span className="text-white text-[10px] font-bold">
-                  {warningCount}/2 strikes
+                  {strikeDisplay}/2 strikes
                 </span>
               </div>
             )}
@@ -175,13 +225,28 @@ export default function WebcamPanel({ onStreamReady, onViolation, onWarning, pro
                 {status === 'loading' ? 'INIT' : `${faceCount} face${faceCount !== 1 ? 's' : ''}`}
               </span>
             </div>
-            {/* Detected prohibited objects */}
+            {/* Detected prohibited objects (TF.js) */}
             {detectedObjects.length > 0 && (
               <div className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-600/90">
                 <Smartphone className="w-2.5 h-2.5 text-red-200" />
                 <span className="text-white text-[10px] font-bold">
                   {[...new Set(detectedObjects.map((o) => o.class))].join(', ')}
                 </span>
+              </div>
+            )}
+            {/* Engine indicators */}
+            {proctoring && (
+              <div className="flex gap-1">
+                {settings.tensorflow && (
+                  <div className="bg-indigo-600/70 px-1.5 py-0.5 rounded-full">
+                    <span className="text-white text-[8px] font-bold">TF.js</span>
+                  </div>
+                )}
+                {settings.objectDetection && (
+                  <div className="bg-orange-600/70 px-1.5 py-0.5 rounded-full">
+                    <span className="text-white text-[8px] font-bold">OBJ</span>
+                  </div>
+                )}
               </div>
             )}
           </div>

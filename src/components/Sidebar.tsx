@@ -4,10 +4,10 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useTheme } from '@/contexts/ThemeContext';
 import { Button } from '@/components/ui/button';
 import {
-    LayoutDashboard, FileText, Route, Briefcase, History,
+    LayoutDashboard, FileText, Route, Briefcase,
     GraduationCap, Code, MessageSquare, Brain, Target,
     ShieldCheck, LogOut, Moon, Sun, Menu, X, ChevronRight,
-    User, BookOpen
+    User, BookOpen, BarChart3, TrendingUp, Building2, CreditCard
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -26,20 +26,27 @@ const Sidebar = () => {
 
     const isActive = (path: string) => location.pathname === path;
 
+    // Conditional dashboard based on user type
+    const dashboardPath = user?.userType === 'institution' ? '/institution/dashboard' : '/dashboard';
+    const dashboardLabel = user?.userType === 'institution' ? 'Institution Dashboard' : 'Dashboard';
+
     const navItems = [
-        { label: 'Dashboard', icon: LayoutDashboard, path: '/dashboard', show: true },
-        { label: 'Smart Resume', icon: FileText, path: '/resume', show: true },
-        { label: 'Career Roadmap', icon: Route, path: '/career-planner', show: true },
-        { label: 'Job Board', icon: Briefcase, path: '/jobs', show: true },
-        { label: 'History', icon: History, path: '/history', show: true },
+        { label: dashboardLabel, icon: LayoutDashboard, path: dashboardPath, show: true },
+        { label: 'Subscription', icon: CreditCard, path: '/institution/subscription', show: user?.userType === 'institution' },
+        { label: 'My Profile', icon: User, path: '/profile', show: user?.userType !== 'institution' },
+        { label: 'Smart Resume', icon: FileText, path: '/resume', show: user?.userType !== 'institution' },
+        { label: 'Profile Analyzer', icon: BarChart3, path: '/profile-analyzer', show: user?.userType !== 'institution' },
+        { label: 'Skill Trends', icon: TrendingUp, path: '/skill-trends', show: user?.userType !== 'institution' },
+        { label: 'Career Roadmap', icon: Route, path: '/career-planner', show: user?.userType !== 'institution' },
+        { label: 'Gap Analysis', icon: Brain, path: '/gap-analysis', show: user?.userType !== 'institution' },
+        { label: 'Job Board', icon: Briefcase, path: '/jobs', show: user?.userType !== 'institution' },
     ];
 
     const practiceItems = [
-        { label: 'Practice Hub', icon: GraduationCap, path: '/practice', show: true },
-        { label: 'Aptitude Test', icon: Brain, path: '/practice-aptitude', show: true },
-        { label: 'Coding Lab', icon: Code, path: '/practice-coding', show: true },
-        { label: 'AI Interview', icon: MessageSquare, path: '/bot-interview', show: true },
-        { label: 'Mock Interview', icon: Target, path: '/mock-interview', show: true },
+        { label: 'Practice Hub', icon: GraduationCap, path: '/practice', show: user?.userType !== 'institution' },
+        { label: 'AI Interview', icon: MessageSquare, path: '/bot-interview', show: user?.userType !== 'institution' },
+        { label: 'Mock Interview', icon: Target, path: '/mock-interview', show: user?.userType !== 'institution' },
+        { label: 'Company Interview', icon: Building2, path: '/company-interview', show: user?.userType !== 'institution' },
     ];
 
     const adminItems = [
@@ -89,7 +96,7 @@ const Sidebar = () => {
 
             {/* User info */}
             {user && !collapsed && (
-                <div className="px-4 py-3 border-b border-border/30">
+                <div className="px-4 py-3 border-b border-border/30 cursor-pointer hover:bg-accent/30 transition-colors" onClick={() => { navigate('/profile'); setMobileOpen(false); }}>
                     <div className="flex items-center gap-2">
                         <div className="w-8 h-8 rounded-full bg-gradient-to-br from-violet-500/20 to-purple-500/20 flex items-center justify-center">
                             <User className="h-4 w-4 text-primary" />

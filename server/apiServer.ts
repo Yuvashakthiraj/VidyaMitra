@@ -8,6 +8,13 @@ import type { Plugin, ViteDevServer } from 'vite';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { loadEnv } from 'vite';
 import { getDb, hashPassword, verifyPassword, generateId } from './db';
+import { DB } from './database';
+import { registerSubscriptionRoutes } from './subscriptionRoutes';
+import { registerS3Routes, initS3 } from './s3Routes';
+import { registerAwsUsageRoutes } from './awsUsageRoutes';
+import { registerSNSRoutes, initSNS } from './snsRoutes';
+import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
+import { trackSESEmail } from './awsUsageCounter';
 
 // ==================== TYPES ====================
 interface ApiKeys {
@@ -18,10 +25,14 @@ interface ApiKeys {
     NEWS_API_KEY: string;
     EXCHANGE_RATE_API_KEY: string;
     OPENAI_API_KEY: string;
-    JUDGE0_API_KEY: string;
-    JUDGE0_API_HOST: string;
-    JUDGE0_BASE_URL: string;
+    // Judge0 – self-hosted AWS instance (primary)
+    JUDGE0_HOST: string;
+    // Judge0 – RapidAPI fallback
+    JUDGE0_RAPIDAPI_KEY: string;
+    JUDGE0_RAPIDAPI_HOST: string;
+    JUDGE0_RAPIDAPI_URL: string;
     GROQ_API_KEY: string;
+    ELEVENLABS_API_KEY: string;
 }
 
 // ==================== RATE LIMITING ====================
@@ -121,18 +132,50 @@ function getQueryParams(req: IncomingMessage): URLSearchParams {
     return new URLSearchParams(qIndex >= 0 ? url.slice(qIndex + 1) : '');
 }
 
-// Simple JWT-like token (session token stored in memory for simplicity)
+function safeParse(data: any, fallback: any = []) {
+    if (!data) return fallback;
+    if (typeof data === 'string') {
+        try { return JSON.parse(data); } catch { return fallback; }
+    }
+    return data;
+}
+
+// Simple JWT-like token (session token stored in memory + persisted to DB)
 const sessions: Map<string, { userId: string; email: string; isAdmin: boolean; name: string }> = new Map();
 
 function createSession(userId: string, email: string, isAdmin: boolean, name: string): string {
     const token = generateId() + '-' + generateId();
     sessions.set(token, { userId, email, isAdmin, name });
+    // Persist to DB so sessions survive server restarts
+    DB.run(
+        'INSERT INTO user_sessions (token, user_id, email, is_admin, name) VALUES (?, ?, ?, ?, ?)',
+        [token, userId, email, isAdmin ? 1 : 0, name]
+    ).catch((err: any) => console.warn('Failed to persist session:', err?.message));
     return token;
+}
+
+async function getSessionAsync(req: IncomingMessage): Promise<{ userId: string; email: string; isAdmin: boolean; name: string } | null> {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.replace('Bearer ', '').trim();
+    if (!token) return null;
+    // Fast path: in-memory
+    const cached = sessions.get(token);
+    if (cached) return cached;
+    // Slow path: look up DB (survives server restarts)
+    try {
+        const row: any = await DB.get('SELECT user_id, email, is_admin, name FROM user_sessions WHERE token = ?', [token]);
+        if (!row) return null;
+        const sess = { userId: row.user_id, email: row.email, isAdmin: !!row.is_admin, name: row.name || '' };
+        sessions.set(token, sess); // re-hydrate memory cache
+        return sess;
+    } catch {
+        return null;
+    }
 }
 
 function getSession(req: IncomingMessage) {
     const authHeader = req.headers.authorization || '';
-    const token = authHeader.replace('Bearer ', '');
+    const token = authHeader.replace('Bearer ', '').trim();
     return sessions.get(token) || null;
 }
 
@@ -388,15 +431,244 @@ function getFallbackExchangeRates() {
     return { base: 'USD', rates: { INR: 83.5, EUR: 0.92, GBP: 0.79, JPY: 149.5 }, lastUpdated: new Date().toISOString() };
 }
 
+// ==================== GITHUB ANALYSIS HELPERS ====================
+
+function extractGitHubUsername(url: string): string | null {
+    if (!url || typeof url !== 'string') return null;
+    const trimmed = url.trim();
+    const match = trimmed.match(/(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_-]+)/i);
+    if (match) return match[1];
+    if (/^[a-zA-Z0-9_-]+$/.test(trimmed)) return trimmed;
+    return null;
+}
+
+interface GitHubProfileData {
+    username: string;
+    publicRepos: number;
+    recentlyActivePushed: number;
+    topLanguages: string[];
+    recentLanguages: string[];
+    totalStars: number;
+    followersCount: number;
+    accountAgeYears: number;
+}
+
+async function fetchGitHubData(githubUrl: string): Promise<GitHubProfileData | null> {
+    try {
+        const username = extractGitHubUsername(githubUrl);
+        if (!username) return null;
+
+        const token = process.env.VITE_GITHUB_API_KEY;
+        const headers: Record<string, string> = {
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'VidyaMitra-App',
+        };
+        if (token) headers['Authorization'] = `token ${token}`;
+
+        const userRes = await fetch(`https://api.github.com/users/${username}`, { headers });
+        if (!userRes.ok) {
+            console.warn(`GitHub user fetch failed for ${username}: ${userRes.status}`);
+            return null;
+        }
+        const userData = await userRes.json() as any;
+
+        const reposRes = await fetch(
+            `https://api.github.com/users/${username}/repos?per_page=30&sort=pushed&type=owner`,
+            { headers }
+        );
+        if (!reposRes.ok) return null;
+        const repos = await reposRes.json() as any[];
+
+        const sixMonthsAgo = new Date();
+        sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+        const langFreq: Record<string, number> = {};
+        const recentLangFreq: Record<string, number> = {};
+        let totalStars = 0;
+        let recentlyActive = 0;
+
+        for (const repo of repos) {
+            if (repo.fork) continue;
+            const lang: string | null = repo.language;
+            if (lang) langFreq[lang] = (langFreq[lang] || 0) + 1;
+            if (new Date(repo.pushed_at as string) > sixMonthsAgo) {
+                recentlyActive++;
+                if (lang) recentLangFreq[lang] = (recentLangFreq[lang] || 0) + 1;
+            }
+            totalStars += (repo.stargazers_count as number) || 0;
+        }
+
+        const topLanguages = Object.entries(langFreq)
+            .sort(([, a], [, b]) => b - a).slice(0, 6).map(([l]) => l);
+        const recentLanguages = Object.entries(recentLangFreq)
+            .sort(([, a], [, b]) => b - a).slice(0, 4).map(([l]) => l);
+        const accountAgeYears = parseFloat(
+            ((Date.now() - new Date(userData.created_at as string).getTime()) / (1000 * 60 * 60 * 24 * 365)).toFixed(1)
+        );
+
+        return {
+            username,
+            publicRepos: (userData.public_repos as number) || 0,
+            recentlyActivePushed: recentlyActive,
+            topLanguages,
+            recentLanguages,
+            totalStars,
+            followersCount: (userData.followers as number) || 0,
+            accountAgeYears,
+        };
+    } catch (err) {
+        console.warn('GitHub API fetch error:', err);
+        return null;
+    }
+}
+
+async function analyzeGitHubForRole(
+    ghData: GitHubProfileData,
+    targetRole: string,
+    groqKey2: string,
+    geminiKey: string
+): Promise<{ github_match: number; github_skills: string[]; insight: string }> {
+    const mathFallback = () => {
+        const langScore = Math.min(30, ghData.topLanguages.length * 5);
+        const activityScore = Math.min(25, ghData.recentlyActivePushed * 4);
+        const quantityScore = Math.min(20, ghData.publicRepos);
+        const starScore = Math.min(10, ghData.totalStars * 0.3);
+        return {
+            github_match: Math.min(100, Math.round(15 + langScore + activityScore + quantityScore * 0.5 + starScore)),
+            github_skills: ghData.topLanguages.slice(0, 4),
+            insight: `${ghData.publicRepos} public repos · ${ghData.recentlyActivePushed} recently active · top: ${ghData.topLanguages.slice(0, 3).join(', ')}.`,
+        };
+    };
+
+    const prompt = `A software developer targets: "${targetRole}"
+
+Their REAL GitHub stats:
+- Public repos (own): ${ghData.publicRepos}
+- Repos pushed in last 6 months: ${ghData.recentlyActivePushed}
+- All-time top languages: ${ghData.topLanguages.join(', ') || 'None'}
+- Recent languages: ${ghData.recentLanguages.join(', ') || 'None'}
+- Total stars earned: ${ghData.totalStars}
+- Followers: ${ghData.followersCount}
+- Account age: ${ghData.accountAgeYears} years
+
+Return ONLY valid JSON:
+{"github_match":<0-100>,"github_skills":["skill1","skill2","skill3"],"insight":"<one sentence>"}
+
+Score by: language relevance to role (40%), recency of activity (30%), quantity (20%), traction (10%).`;
+
+    // Primary: GROQ_API_KEY_2 dedicated for GitHub analysis
+    if (groqKey2) {
+        try {
+            const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey2}` },
+                body: JSON.stringify({
+                    model: 'llama-3.3-70b-versatile',
+                    messages: [
+                        { role: 'system', content: 'You are a precise technical recruiter. Return only valid compact JSON.' },
+                        { role: 'user', content: prompt },
+                    ],
+                    temperature: 0.2,
+                    max_tokens: 200,
+                }),
+            });
+            if (r.ok) {
+                const data = await r.json() as any;
+                let content: string = data.choices?.[0]?.message?.content?.trim() || '';
+                content = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                const parsed = JSON.parse(content) as any;
+                return {
+                    github_match: Math.min(100, Math.max(0, Number(parsed.github_match) || 30)),
+                    github_skills: (parsed.github_skills as string[]) || ghData.topLanguages.slice(0, 3),
+                    insight: (parsed.insight as string) || '',
+                };
+            }
+        } catch (e) {
+            console.warn('GROQ_API_KEY_2 GitHub analysis failed, trying Gemini:', e);
+        }
+    }
+
+    // Fallback: Gemini
+    if (geminiKey) {
+        try {
+            const r = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: prompt }] }],
+                        generationConfig: { temperature: 0.2, maxOutputTokens: 250 },
+                    }),
+                }
+            );
+            if (r.ok) {
+                const data = await r.json() as any;
+                let content: string = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+                content = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                const parsed = JSON.parse(content) as any;
+                return {
+                    github_match: Math.min(100, Math.max(0, Number(parsed.github_match) || 30)),
+                    github_skills: (parsed.github_skills as string[]) || ghData.topLanguages.slice(0, 3),
+                    insight: (parsed.insight as string) || '',
+                };
+            }
+        } catch (e) {
+            console.warn('Gemini GitHub analysis fallback failed:', e);
+        }
+    }
+
+    // Ultimate math-based fallback
+    return mathFallback();
+}
+
+// ==================== PERSISTENT PROCTORING SETTINGS ====================
+// Module-level so settings survive Vite HMR (loaded from DB on first request)
+let proctoringSettings = {
+    tensorflow: true,
+    objectDetection: true,
+    tfIntervalMs: 1500,
+    noFaceStrikeSec: 5,
+};
+let _procSettingsLoaded = false;
+
+async function loadProctoringSettingsFromDB(): Promise<void> {
+    if (_procSettingsLoaded) return;
+    try {
+        const row = await DB.get('SELECT value FROM app_settings WHERE id = ?', ['proctoring']);
+        if (row?.value) {
+            const saved = typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
+            Object.assign(proctoringSettings, saved);
+            proctoringSettings.tensorflow = true; // Always forced — Rekognition removed, TF.js is the only proctoring engine
+        }
+        _procSettingsLoaded = true; // Only set to true if query succeeds
+    } catch {
+        // Table may not exist yet — use defaults silently (will retry next time)
+    }
+}
+
+async function saveProctoringSettingsToDB(): Promise<void> {
+    try {
+        await DB.run(
+            "INSERT OR REPLACE INTO app_settings (id, value, updated_at) VALUES (?, ?, datetime('now'))",
+            ['proctoring', JSON.stringify(proctoringSettings)]
+        );
+    } catch {
+        // Non-critical — settings work from memory even if save fails
+    }
+}
+
 // ==================== VITE PLUGIN ====================
 export function vidyaMitraApiPlugin(): Plugin {
     let keys: ApiKeys = {} as ApiKeys;
+    let resolvedEnv: Record<string, string> = {};
 
     return {
         name: 'vidyamitra-api',
 
         configResolved(config) {
             const env = loadEnv(config.mode, config.root, '');
+            resolvedEnv = env;
             keys = {
                 GEMINI_API_KEY: env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY || '',
                 GEMINI_IMAGE_API_KEY: env.GEMINI_IMAGE_API_KEY || env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY || '',
@@ -405,14 +677,22 @@ export function vidyaMitraApiPlugin(): Plugin {
                 NEWS_API_KEY: env.NEWS_API_KEY || '',
                 EXCHANGE_RATE_API_KEY: env.EXCHANGE_RATE_API_KEY || '',
                 OPENAI_API_KEY: env.OPENAI_API_KEY || '',
-                JUDGE0_API_KEY: env.VITE_JUDGE0_API_KEY || '',
-                JUDGE0_API_HOST: env.VITE_JUDGE0_API_HOST || 'judge029.p.rapidapi.com',
-                JUDGE0_BASE_URL: env.VITE_JUDGE0_BASE_URL || 'https://judge029.p.rapidapi.com',
+                // Judge0 – self-hosted AWS instance (primary)
+                JUDGE0_HOST: env.JUDGE0_HOST || 'http://54.234.23.242:2358',
+                // Judge0 – RapidAPI fallback
+                JUDGE0_RAPIDAPI_KEY: env.JUDGE0_RAPIDAPI_KEY || env.VITE_JUDGE0_API_KEY || '',
+                JUDGE0_RAPIDAPI_HOST: env.JUDGE0_RAPIDAPI_HOST || env.VITE_JUDGE0_API_HOST || 'judge029.p.rapidapi.com',
+                JUDGE0_RAPIDAPI_URL: env.JUDGE0_RAPIDAPI_URL || env.VITE_JUDGE0_BASE_URL || 'https://judge029.p.rapidapi.com',
                 GROQ_API_KEY: env.GROQ_API_KEY || '',
+                ELEVENLABS_API_KEY: env.ELEVENLABS_API_KEY || '',
             };
 
-            // Initialize DB
-            getDb();
+            const dbType = (env.DB_TYPE || 'sqlite').toLowerCase();
+            if (dbType === 'sqlite') {
+                getDb(); // Initialize SQLite schema + seed data
+            } else {
+                console.log(`✅ Database mode: SUPABASE (${env.SUPABASE_URL})`);
+            }
 
             console.log('✅ VidyaMitra API server initialized');
             console.log('  Gemini:', keys.GEMINI_API_KEY ? '✅' : '❌');
@@ -421,6 +701,16 @@ export function vidyaMitraApiPlugin(): Plugin {
             console.log('  News:', keys.NEWS_API_KEY ? '✅' : '❌');
             console.log('  Exchange:', keys.EXCHANGE_RATE_API_KEY ? '✅' : '❌');
             console.log('  Groq:', keys.GROQ_API_KEY ? '✅' : '❌');
+            console.log('  ElevenLabs:', keys.ELEVENLABS_API_KEY ? '✅' : '❌');
+            console.log('  Judge0 (AWS):', keys.JUDGE0_HOST ? `✅ ${keys.JUDGE0_HOST}` : '❌');
+            console.log('  Judge0 (RapidAPI fallback):', keys.JUDGE0_RAPIDAPI_KEY ? '✅' : '❌');
+
+            // Initialize AWS S3
+            initS3(env);
+            console.log('  S3:', env.AWS_ACCESS_KEY_ID ? `✅ (bucket: ${env.S3_BUCKET_NAME || 'vidyamitra-uploads-629496'})` : '❌');
+
+            // Initialize AWS SNS for marketing
+            initSNS(env);
         },
 
         configureServer(server: ViteDevServer) {
@@ -445,18 +735,33 @@ export function vidyaMitraApiPlugin(): Plugin {
                     const { email, password } = await parseBody(req);
                     if (!email || !password) return sendJson(res, 400, { error: 'Email and password required' });
 
-                    const db = getDb();
-                    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
+                    const user = await DB.get('SELECT * FROM users WHERE email = ?', [email]) as any;
                     if (!user) return sendJson(res, 401, { error: 'Invalid email or password' });
 
                     if (!verifyPassword(password, user.password_hash)) {
                         return sendJson(res, 401, { error: 'Invalid email or password' });
                     }
 
+                    const userType = user.user_type || (user.is_admin ? 'admin' : 'student');
+                    let institutionName = null;
+                    if (user.institution_id) {
+                        const inst = await DB.get('SELECT name FROM institutions WHERE id = ?', [user.institution_id]) as any;
+                        institutionName = inst?.name;
+                    }
+
                     const token = createSession(user.id, user.email, !!user.is_admin, user.name || '');
                     sendJson(res, 200, {
                         token,
-                        user: { id: user.id, email: user.email, name: user.name, isAdmin: !!user.is_admin },
+                        user: { 
+                            id: user.id, 
+                            email: user.email, 
+                            name: user.name, 
+                            isAdmin: !!user.is_admin,
+                            userType: userType,
+                            studentCategory: user.student_category,
+                            institutionId: user.institution_id,
+                            institutionName: institutionName
+                        },
                     });
                 } catch (err: any) {
                     sendJson(res, 500, { error: err.message });
@@ -466,25 +771,38 @@ export function vidyaMitraApiPlugin(): Plugin {
             server.middlewares.use('/api/auth/signup', async (req: any, res: any, next: any) => {
                 if (req.method !== 'POST') return next();
                 try {
-                    const { email, password, name } = await parseBody(req);
+                    const { email, password, name, studentCategory, institutionId } = await parseBody(req);
                     if (!email || !password) return sendJson(res, 400, { error: 'Email and password required' });
                     if (email === 'admin@vidyamitra.com') return sendJson(res, 403, { error: 'Email reserved for admin' });
 
-                    const db = getDb();
-                    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+                    const existing = await DB.get('SELECT id FROM users WHERE email = ?', [email]);
                     if (existing) return sendJson(res, 409, { error: 'Email already in use' });
 
                     const id = generateId();
                     const passwordHash = hashPassword(password);
                     const displayName = name || email.split('@')[0];
 
-                    db.prepare('INSERT INTO users (id, email, password_hash, name, is_admin) VALUES (?, ?, ?, ?, 0)')
-                        .run(id, email, passwordHash, displayName);
+                    await DB.run(
+                        'INSERT INTO users (id, email, password_hash, name, is_admin, user_type, student_category, institution_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)'
+                    , [id, email, passwordHash, displayName, 'student', studentCategory || null, institutionId || null]);
+
+                    // Update institution student count if linked
+                    if (institutionId) {
+                        await DB.run('UPDATE institutions SET student_count = student_count + 1 WHERE id = ?', [institutionId]);
+                    }
 
                     const token = createSession(id, email, false, displayName);
                     sendJson(res, 201, {
                         token,
-                        user: { id, email, name: displayName, isAdmin: false },
+                        user: { 
+                            id, 
+                            email, 
+                            name: displayName, 
+                            isAdmin: false,
+                            userType: 'student',
+                            studentCategory: studentCategory || null,
+                            institutionId: institutionId || null
+                        },
                     });
                 } catch (err: any) {
                     sendJson(res, 500, { error: err.message });
@@ -493,7 +811,7 @@ export function vidyaMitraApiPlugin(): Plugin {
 
             server.middlewares.use('/api/auth/me', async (req: any, res: any, next: any) => {
                 if (req.method !== 'GET') return next();
-                const session = getSession(req);
+                const session = await getSessionAsync(req);
                 if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
                 sendJson(res, 200, { user: { id: session.userId, email: session.email, name: session.name, isAdmin: session.isAdmin } });
             });
@@ -501,9 +819,286 @@ export function vidyaMitraApiPlugin(): Plugin {
             server.middlewares.use('/api/auth/logout', async (req: any, res: any, next: any) => {
                 if (req.method !== 'POST') return next();
                 const authHeader = req.headers.authorization || '';
-                const token = authHeader.replace('Bearer ', '');
+                const token = authHeader.replace('Bearer ', '').trim();
                 sessions.delete(token);
+                if (token) {
+                    DB.run('DELETE FROM user_sessions WHERE token = ?', [token]).catch(() => {});
+                }
                 sendJson(res, 200, { success: true });
+            });
+
+            // ==================== INSTITUTION ROUTES ====================
+            // Institution Login
+            server.middlewares.use('/api/auth/institution/login', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const { institutionId, password } = await parseBody(req);
+                    if (!institutionId || !password) return sendJson(res, 400, { error: 'Institution ID and password required' });
+
+                    const institution = await DB.get('SELECT * FROM institutions WHERE id = ? AND is_active = 1', [institutionId]) as any;
+                    if (!institution) return sendJson(res, 401, { error: 'Invalid institution or inactive account' });
+
+                    if (!verifyPassword(password, institution.password_hash)) {
+                        return sendJson(res, 401, { error: 'Invalid password' });
+                    }
+
+                    const token = createSession(institution.id, institution.email, false, institution.name);
+                    sendJson(res, 200, {
+                        token,
+                        user: { 
+                            id: institution.id, 
+                            email: institution.email, 
+                            name: institution.name, 
+                            isAdmin: false,
+                            userType: 'institution',
+                            institutionCode: institution.institution_code
+                        },
+                    });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // Get All Active Institutions (for dropdown)
+            server.middlewares.use('/api/institutions/list', async (req: any, res: any, next: any) => {
+                if (req.method !== 'GET') return next();
+                try {
+                    const institutions = await DB.all(
+                        'SELECT id, name, institution_code, institution_type, location FROM institutions WHERE is_active = 1 ORDER BY name'
+                    , []);
+                    sendJson(res, 200, { institutions });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // Get Institution's Students
+            server.middlewares.use(async (req: any, res: any, next: any) => {
+                const path = getUrlPath(req);
+                const studentsMatch = path.match(/^\/api\/institutions\/([^\/]+)\/students$/);
+                if (!studentsMatch || req.method !== 'GET') return next();
+                
+                try {
+                    const session = getSession(req);
+                    if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                    const institutionId = studentsMatch[1];
+                    
+                    // Verify institution access
+                    const institution = await DB.get('SELECT * FROM institutions WHERE id = ?', [institutionId]) as any;
+                    if (!institution) return sendJson(res, 404, { error: 'Institution not found' });
+                    
+                    // Only allow institution itself or admin to view
+                    if (session.userId !== institutionId && !session.isAdmin) {
+                        return sendJson(res, 403, { error: 'Access denied' });
+                    }
+
+                    const students = await DB.all(`
+                        SELECT id, email, name, student_category, target_role, created_at,
+                               (SELECT COUNT(*) FROM interviews WHERE user_id = users.id) as interview_count,
+                               (SELECT AVG(score) FROM interviews WHERE user_id = users.id AND completed = 1) as avg_score
+                        FROM users 
+                        WHERE institution_id = ? AND user_type = 'student'
+                        ORDER BY created_at DESC
+                    `, [institutionId]);
+
+                    sendJson(res, 200, { students, institutionName: institution.name });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // Get Institution Analytics
+            server.middlewares.use(async (req: any, res: any, next: any) => {
+                const path = getUrlPath(req);
+                const analyticsMatch = path.match(/^\/api\/institutions\/([^\/]+)\/analytics$/);
+                if (!analyticsMatch || req.method !== 'GET') return next();
+                
+                try {
+                    const session = getSession(req);
+                    if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                    const institutionId = analyticsMatch[1];
+                    
+                    // Verify institution access
+                    if (session.userId !== institutionId && !session.isAdmin) {
+                        return sendJson(res, 403, { error: 'Access denied' });
+                    }
+
+                    const totalStudents = await DB.get('SELECT COUNT(*) as count FROM users WHERE institution_id = ?', [institutionId]) as any;
+                    const totalInterviews = await DB.get('SELECT COUNT(*) as count FROM interviews i JOIN users u ON i.user_id = u.id WHERE u.institution_id = ?', [institutionId]) as any;
+                    const completedInterviews = await DB.get('SELECT COUNT(*) as count FROM interviews i JOIN users u ON i.user_id = u.id WHERE u.institution_id = ? AND i.completed = 1', [institutionId]) as any;
+                    const avgScore = await DB.get('SELECT AVG(score) as avg FROM interviews i JOIN users u ON i.user_id = u.id WHERE u.institution_id = ? AND i.completed = 1', [institutionId]) as any;
+                    
+                    const categoryBreakdown = await DB.all(`
+                        SELECT student_category, COUNT(*) as count 
+                        FROM users 
+                        WHERE institution_id = ? AND student_category IS NOT NULL
+                        GROUP BY student_category
+                    `, [institutionId]);
+
+                    const topPerformers = await DB.all(`
+                        SELECT u.id, u.name, u.email, AVG(i.score) as avg_score, COUNT(i.id) as interview_count
+                        FROM users u
+                        LEFT JOIN interviews i ON u.id = i.user_id AND i.completed = 1
+                        WHERE u.institution_id = ?
+                        GROUP BY u.id
+                        ORDER BY avg_score DESC
+                        LIMIT 5
+                    `, [institutionId]);
+
+                    sendJson(res, 200, {
+                        totalStudents: totalStudents.count,
+                        totalInterviews: totalInterviews.count,
+                        completedInterviews: completedInterviews.count,
+                        averageScore: avgScore.avg || 0,
+                        categoryBreakdown,
+                        topPerformers
+                    });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // ==================== ADMIN - INSTITUTION MANAGEMENT ====================
+            // Get All Institutions (Admin Only)
+            server.middlewares.use('/api/admin/institutions', async (req: any, res: any, next: any) => {
+                if (req.method !== 'GET') return next();
+                try {
+                    const session = getSession(req);
+                    if (!session || !session.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
+
+                    const institutions = await DB.all(`
+                        SELECT i.*, 
+                               (SELECT COUNT(*) FROM users WHERE institution_id = i.id) as student_count
+                        FROM institutions i
+                        ORDER BY i.created_at DESC
+                    `, []);
+                    sendJson(res, 200, { institutions });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // Update Institution (Admin Only)
+            server.middlewares.use(async (req: any, res: any, next: any) => {
+                const path = getUrlPath(req);
+                const updateMatch = path.match(/^\/api\/admin\/institutions\/([^\/]+)$/);
+                if (!updateMatch || req.method !== 'PUT') return next();
+                
+                try {
+                    const session = getSession(req);
+                    if (!session || !session.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
+
+                    const institutionId = updateMatch[1];
+                    const { name, email, institutionCode, institutionType, location, contactPerson, phone, website, isActive } = await parseBody(req);
+                    
+                    await DB.run(`
+                        UPDATE institutions 
+                        SET name = ?, email = ?, institution_code = ?, institution_type = ?, 
+                            location = ?, contact_person = ?, phone = ?, website = ?, is_active = ?,
+                            updated_at = datetime('now')
+                        WHERE id = ?
+                    `, [name, email, institutionCode, institutionType, location, contactPerson, phone, website, isActive ? 1 : 0, institutionId]);
+
+                    sendJson(res, 200, { success: true, message: 'Institution updated' });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // Create New Institution (Admin Only)
+            server.middlewares.use('/api/admin/institutions/create', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const session = getSession(req);
+                    if (!session || !session.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
+
+                    const { name, email, password, institutionCode, institutionType, location, contactPerson, phone, website } = await parseBody(req);
+                    if (!name || !email || !password || !institutionCode) {
+                        return sendJson(res, 400, { error: 'Name, email, password, and institution code are required' });
+                    }
+
+                    const existing = await DB.get('SELECT id FROM institutions WHERE email = ? OR institution_code = ?', [email, institutionCode]);
+                    if (existing) return sendJson(res, 409, { error: 'Institution email or code already exists' });
+
+                    const id = generateId();
+                    const passwordHash = hashPassword(password);
+                    await DB.run(`
+                        INSERT INTO institutions (id, name, email, password_hash, institution_code, institution_type, location, contact_person, phone, website)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `, [id, name, email, passwordHash, institutionCode, institutionType || 'University', location, contactPerson, phone, website]);
+
+                    sendJson(res, 201, { success: true, message: 'Institution created', institutionId: id });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // ==================== SUBSCRIPTION MANAGEMENT ====================
+            registerSubscriptionRoutes(server, keys, getSession, sendJson, parseBody, getUrlPath);
+
+            // ==================== S3 FILE MANAGEMENT ====================
+            registerS3Routes(server, keys, getSession, getSessionAsync, sendJson, parseBody);
+
+            // ==================== AWS USAGE TRACKING ====================
+            registerAwsUsageRoutes(server, resolvedEnv, getSessionAsync, sendJson);
+
+            // ==================== SNS MARKETING NOTIFICATIONS ====================
+            registerSNSRoutes(server, resolvedEnv, getSessionAsync, sendJson, parseBody);
+
+            // GET/POST /api/settings/proctoring — admin proctoring settings (DB-persisted)
+            server.middlewares.use('/api/settings/proctoring', async (req: any, res: any, next: any) => {
+                if (req.method === 'GET') {
+                    try {
+                        await loadProctoringSettingsFromDB();
+                        return sendJson(res, 200, { ...proctoringSettings });
+                    } catch (err: any) {
+                        console.warn('[Proctoring] Settings load failed (DB table may not exist yet), using defaults');
+                        return sendJson(res, 200, { ...proctoringSettings });
+                    }
+                }
+                if (req.method === 'POST') {
+                    const session = await getSessionAsync(req);
+                    if (!session?.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
+                    try {
+                        const body = await parseBody(req);
+                        if (typeof body.tensorflow === 'boolean') proctoringSettings.tensorflow = body.tensorflow;
+                        if (typeof body.objectDetection === 'boolean') proctoringSettings.objectDetection = body.objectDetection;
+                        if (typeof body.tfIntervalMs === 'number') proctoringSettings.tfIntervalMs = Math.max(1000, Math.min(10000, body.tfIntervalMs));
+                        if (typeof body.noFaceStrikeSec === 'number') proctoringSettings.noFaceStrikeSec = Math.max(3, Math.min(15, body.noFaceStrikeSec));
+                        await saveProctoringSettingsToDB();
+                        return sendJson(res, 200, { success: true, settings: proctoringSettings });
+                    } catch (err: any) {
+                        return sendJson(res, 500, { error: err.message });
+                    }
+                }
+                return next();
+            });
+
+            // POST /api/proctor/violation — log proctoring abort for admin review
+            server.middlewares.use('/api/proctor/violation', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const session = await getSessionAsync(req);
+                    if (!session) return sendJson(res, 200, {});
+                    const { interviewId, reason, violationType } = await parseBody(req);
+                    await DB.run(
+                        'INSERT INTO proctoring_violations (id, user_id, interview_id, violation_type, reason, strike_count, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                        [
+                            generateId(),
+                            session.userId,
+                            interviewId || null,
+                            violationType || 'proctoring_abort',
+                            reason || 'Proctoring violation',
+                            2,
+                            JSON.stringify({ abortedAt: new Date().toISOString(), interviewId }),
+                        ]
+                    );
+                    sendJson(res, 200, { success: true });
+                } catch {
+                    sendJson(res, 200, {}); // Non-critical, silent
+                }
             });
 
             // ==================== GEMINI PROXY ====================
@@ -534,6 +1129,249 @@ export function vidyaMitraApiPlugin(): Plugin {
                 if (!query) return sendJson(res, 400, { error: 'q parameter required' });
                 const videos = await fetchYouTubeVideos(keys.YOUTUBE_API_KEY, query, maxResults);
                 sendJson(res, 200, { videos });
+            });
+
+            // ==================== YOUTUBE COURSES (Profile Analyzer) ====================
+            server.middlewares.use('/api/youtube/courses', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const { gaps, careerGoal } = await parseBody(req);
+                    const query = `${careerGoal} ${gaps?.[0] || ''} tutorial course`;
+                    const videos = await fetchYouTubeVideos(keys.YOUTUBE_API_KEY, query, 6);
+                    sendJson(res, 200, videos);
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // ==================== GROQ AI ROADMAP (Profile Analyzer) ====================
+            server.middlewares.use('/api/groq/roadmap', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const { skills, careerGoal } = await parseBody(req);
+                    if (!careerGoal) return sendJson(res, 400, { error: 'careerGoal required' });
+                    if (!keys.GROQ_API_KEY) return sendJson(res, 503, { error: 'Groq API key not configured' });
+
+                    const prompt = `You are an expert technical recruiter assessing a candidate's profile for the "${careerGoal}" role based on 2026 industry standards.
+Here are the candidate's extracted technical skills and their normalized proficiency scores (0-100):
+${JSON.stringify(skills)}
+
+Calculate a realistic overall readiness score out of 100.
+Identify top 2 missing critical skills/gaps based on 2026 standards for ${careerGoal}.
+Generate a multi-phase learning roadmap containing general improvements, job-based improvements, and specific actionable phases to close those gaps.
+
+Return ONLY valid JSON format:
+{
+  "score": number,
+  "gaps": ["skill1", "skill2"],
+  "improvements": {
+    "general": ["string", "string"],
+    "job_based": ["string", "string"]
+  },
+  "phases": [
+    { "phase": "1", "title": "Foundation", "focus": "string", "duration": "string", "details": "string" },
+    { "phase": "2", "title": "Advanced", "focus": "string", "duration": "string", "details": "string" }
+  ]
+}`;
+
+                    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${keys.GROQ_API_KEY}`,
+                        },
+                        body: JSON.stringify({
+                            model: 'llama-3.3-70b-versatile',
+                            messages: [
+                                { role: 'system', content: 'You output only structured JSON containing score, gaps array, improvements, and phases.' },
+                                { role: 'user', content: prompt },
+                            ],
+                            temperature: 0.2,
+                            response_format: { type: 'json_object' }
+                        }),
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Groq API error: ${response.status}`);
+                    }
+
+                    const data = await response.json();
+                    const aiResponse = JSON.parse(data.choices[0].message.content);
+                    sendJson(res, 200, aiResponse);
+                } catch (err: any) {
+                    console.error('Groq roadmap error:', err);
+                    // Fallback response
+                    sendJson(res, 200, {
+                        score: 75,
+                        gaps: ["Advanced System Design", "Production Deployments"],
+                        improvements: {
+                            general: ["Increase contribution frequency", "Improve code documentation"],
+                            job_based: ["Build production-scale projects", "Learn industry best practices"]
+                        },
+                        phases: [
+                            { phase: "1", title: "Foundation", focus: "Core Skills", duration: "2-3 weeks", details: "Master fundamental concepts" },
+                            { phase: "2", title: "Application", focus: "Projects", duration: "4 weeks", details: "Build real-world applications" }
+                        ]
+                    });
+                }
+            });
+
+            // ==================== TEXTRACT RESUME PARSER (via AWS Lambda) ====================
+            // POST /api/resume/extract  { bucket, key }  → { text }
+            // Calls the deployed Lambda + Textract function.  Falls back gracefully if
+            // LAMBDA_TEXTRACT_URL is not configured (returns 503 so client can use PDF.js).
+            server.middlewares.use('/api/resume/extract', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const lambdaUrl = process.env.AWS_LAMBDA_RESUME_API;
+                    if (!lambdaUrl) {
+                        return sendJson(res, 503, { error: 'Textract Lambda not configured' });
+                    }
+
+                    const { bucket, key } = await parseBody(req);
+                    if (!bucket || !key) {
+                        return sendJson(res, 400, { error: 'bucket and key are required' });
+                    }
+
+                    const lambdaRes = await fetch(lambdaUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ bucket, key }),
+                    });
+
+                    const raw = await lambdaRes.json() as any;
+
+                    // API Gateway may wrap Lambda output — body can be a JSON string
+                    const data = (typeof raw.body === 'string')
+                        ? JSON.parse(raw.body)
+                        : raw;
+
+                    if (!lambdaRes.ok || data.error) {
+                        console.error('Textract Lambda error:', data.error);
+                        return sendJson(res, 502, { error: data.error ?? 'Lambda returned an error' });
+                    }
+
+                    if (!data.text || data.text.trim().length === 0) {
+                        console.error('Textract returned empty text');
+                        return sendJson(res, 502, { error: 'Textract returned empty text' });
+                    }
+
+                    console.log(`✅ Textract extracted ${data.text.length} chars from ${key}`);
+                    sendJson(res, 200, { text: data.text });
+                } catch (err: any) {
+                    console.error('POST /api/resume/extract error:', err);
+                    sendJson(res, 500, { error: 'Resume text extraction failed' });
+                }
+            });
+
+            // ==================== TEXTRACT HEALTH CHECK ====================
+            // GET /api/textract/health  — verifies Lambda is reachable. No auth required.
+            server.middlewares.use('/api/textract/health', async (req: any, res: any, next: any) => {
+                if (req.method !== 'GET') return next();
+                const lambdaUrl = process.env.AWS_LAMBDA_RESUME_API;
+                if (!lambdaUrl) return sendJson(res, 503, { ok: false, reason: 'AWS_LAMBDA_RESUME_API not set in .env' });
+                try {
+                    const r = await fetch(lambdaUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ bucket: 'ping', key: 'ping' }),
+                    });
+                    const raw = await r.json() as any;
+                    const data = typeof raw.body === 'string' ? JSON.parse(raw.body) : raw;
+                    // Any response (even "key not found") means Lambda is reachable
+                    sendJson(res, 200, { ok: true, lambdaStatus: r.status, lambdaResponse: data });
+                } catch (err: any) {
+                    sendJson(res, 502, { ok: false, reason: err.message });
+                }
+            });
+
+            // ==================== LEETCODE PROXY (Profile Analyzer) ====================
+            server.middlewares.use('/api/leetcode/profile', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const { username } = await parseBody(req);
+                    if (!username) return sendJson(res, 400, { error: 'username required' });
+
+                    const query = `
+                        query getUserProfile($username: String!) {
+                            matchedUser(username: $username) {
+                                profile {
+                                    ranking
+                                    reputation
+                                }
+                                submitStats {
+                                    acSubmissionNum {
+                                        difficulty
+                                        count
+                                    }
+                                }
+                                badges {
+                                    name
+                                    icon
+                                }
+                            }
+                            userContestRanking(username: $username) {
+                                rating
+                                globalRanking
+                                attendedContestsCount
+                            }
+                        }
+                    `;
+
+                    const response = await fetch('https://leetcode.com/graphql', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'User-Agent': 'Mozilla/5.0',
+                            'Referer': 'https://leetcode.com'
+                        },
+                        body: JSON.stringify({
+                            query,
+                            variables: { username }
+                        })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`LeetCode API error: ${response.status}`);
+                    }
+
+                    const data = await response.json();
+                    const user = data.data?.matchedUser;
+                    const contest = data.data?.userContestRanking;
+
+                    if (!user) {
+                        return sendJson(res, 404, { error: 'LeetCode profile not found' });
+                    }
+
+                    const problems = {
+                        easy: user.submitStats?.acSubmissionNum?.find((s: any) => s.difficulty === 'Easy')?.count || 0,
+                        medium: user.submitStats?.acSubmissionNum?.find((s: any) => s.difficulty === 'Medium')?.count || 0,
+                        hard: user.submitStats?.acSubmissionNum?.find((s: any) => s.difficulty === 'Hard')?.count || 0
+                    };
+
+                    const totalSolved = problems.easy + problems.medium + problems.hard;
+                    const skillScore = Math.min(100, Math.round(
+                        (problems.easy * 1) + 
+                        (problems.medium * 3) + 
+                        (problems.hard * 5)
+                    ) / 10);
+
+                    sendJson(res, 200, {
+                        username,
+                        totalSolved,
+                        problems,
+                        ranking: user.profile?.ranking || null,
+                        contestRating: contest?.rating ? Math.round(contest.rating) : null,
+                        contestRank: contest?.globalRanking || null,
+                        contestsAttended: contest?.attendedContestsCount || 0,
+                        badges: user.badges?.map((b: any) => b.name) || [],
+                        skillScore,
+                        level: skillScore >= 80 ? 'Expert' : skillScore >= 60 ? 'Advanced' : skillScore >= 40 ? 'Intermediate' : 'Beginner'
+                    });
+                } catch (err: any) {
+                    console.error('LeetCode proxy error:', err);
+                    sendJson(res, 500, { error: err.message });
+                }
             });
 
             // ==================== PEXELS PROXY ====================
@@ -571,13 +1409,12 @@ export function vidyaMitraApiPlugin(): Plugin {
                     if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
                     const params = getQueryParams(req);
                     const allParam = params.get('all');
-                    const db = getDb();
 
                     if (allParam === 'true' && session.isAdmin) {
-                        const interviews = db.prepare('SELECT * FROM interviews ORDER BY created_at DESC').all();
+                        const interviews = await DB.all('SELECT * FROM interviews ORDER BY created_at DESC', []);
                         return sendJson(res, 200, { interviews });
                     }
-                    const interviews = db.prepare('SELECT * FROM interviews WHERE user_id = ? ORDER BY created_at DESC').all(session.userId);
+                    const interviews = await DB.all('SELECT * FROM interviews WHERE user_id = ? ORDER BY created_at DESC', [session.userId]);
                     return sendJson(res, 200, { interviews });
                 }
 
@@ -586,13 +1423,11 @@ export function vidyaMitraApiPlugin(): Plugin {
                     try {
                         const body = await parseBody(req);
                         const id = body.id || generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT OR REPLACE INTO interviews (id, user_id, role_id, role_name, questions, answers, completed, score, feedback, outcome, is_practice, aborted, abort_reason, ai_detection_count, start_time, end_time)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-                            .run(id, session.userId, body.roleId || '', body.roleName || '', JSON.stringify(body.questions || []), JSON.stringify(body.answers || []),
+                        await DB.run(`INSERT OR REPLACE INTO interviews (id, user_id, role_id, role_name, questions, answers, completed, score, feedback, outcome, is_practice, aborted, abort_reason, ai_detection_count, start_time, end_time)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [id, session.userId, body.roleId || '', body.roleName || '', JSON.stringify(body.questions || []), JSON.stringify(body.answers || []),
                                 body.completed ? 1 : 0, body.score || null, body.feedback || '', body.outcome || '',
                                 body.isPracticeMode ? 1 : 0, body.aborted ? 1 : 0, body.abortReason || '', body.aiDetectionCount || 0,
-                                body.startTime || new Date().toISOString(), body.endTime || null);
+                                body.startTime || new Date().toISOString(), body.endTime || null]);
                         sendJson(res, 201, { success: true, id });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -604,8 +1439,7 @@ export function vidyaMitraApiPlugin(): Plugin {
                     if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
                     const idMatch = path.match(/^\/(.+)/);
                     if (idMatch) {
-                        const db = getDb();
-                        db.prepare('DELETE FROM interviews WHERE id = ?').run(idMatch[1]);
+                        await DB.run('DELETE FROM interviews WHERE id = ?', [idMatch[1]]);
                         return sendJson(res, 200, { success: true });
                     }
                 }
@@ -619,8 +1453,7 @@ export function vidyaMitraApiPlugin(): Plugin {
                 if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
 
                 if (req.method === 'GET') {
-                    const db = getDb();
-                    const results = db.prepare('SELECT * FROM practice_aptitude WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').all(session.userId);
+                    const results = await DB.all('SELECT * FROM practice_aptitude WHERE user_id = ? ORDER BY created_at DESC LIMIT 50', [session.userId]);
                     return sendJson(res, 200, { results });
                 }
 
@@ -628,12 +1461,10 @@ export function vidyaMitraApiPlugin(): Plugin {
                     try {
                         const body = await parseBody(req);
                         const id = generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT INTO practice_aptitude (id, user_id, score, total_questions, correct_answers, category_performance, weak_topics, recommendations, completed_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-                            .run(id, session.userId, body.score, body.totalQuestions, body.correctAnswers,
+                        await DB.run(`INSERT INTO practice_aptitude (id, user_id, score, total_questions, correct_answers, category_performance, weak_topics, recommendations, completed_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [id, session.userId, body.score, body.totalQuestions, body.correctAnswers,
                                 JSON.stringify(body.categoryPerformance || {}), JSON.stringify(body.weakTopics || []),
-                                JSON.stringify(body.recommendations || []), body.completedAt || new Date().toISOString());
+                                JSON.stringify(body.recommendations || []), body.completedAt || new Date().toISOString()]);
                         sendJson(res, 201, { success: true, id });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -649,8 +1480,7 @@ export function vidyaMitraApiPlugin(): Plugin {
                 if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
 
                 if (req.method === 'GET') {
-                    const db = getDb();
-                    const results = db.prepare('SELECT * FROM practice_interviews WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').all(session.userId);
+                    const results = await DB.all('SELECT * FROM practice_interviews WHERE user_id = ? ORDER BY created_at DESC LIMIT 50', [session.userId]);
                     return sendJson(res, 200, { results });
                 }
 
@@ -658,13 +1488,11 @@ export function vidyaMitraApiPlugin(): Plugin {
                     try {
                         const body = await parseBody(req);
                         const id = generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT INTO practice_interviews (id, user_id, role_id, role_name, questions, overall_score, average_question_score, strengths, improvements, recommendations, completed_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-                            .run(id, session.userId, body.roleId || '', body.roleName || '', JSON.stringify(body.questions || []),
+                        await DB.run(`INSERT INTO practice_interviews (id, user_id, role_id, role_name, questions, overall_score, average_question_score, strengths, improvements, recommendations, completed_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [id, session.userId, body.roleId || '', body.roleName || '', JSON.stringify(body.questions || []),
                                 body.overallScore || 0, body.averageQuestionScore || 0, JSON.stringify(body.strengths || []),
                                 JSON.stringify(body.improvements || []), JSON.stringify(body.recommendations || []),
-                                body.completedAt || new Date().toISOString());
+                                body.completedAt || new Date().toISOString()]);
                         sendJson(res, 201, { success: true, id });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -680,8 +1508,7 @@ export function vidyaMitraApiPlugin(): Plugin {
                 if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
 
                 if (req.method === 'GET') {
-                    const db = getDb();
-                    const results = db.prepare('SELECT * FROM bot_interviews WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').all(session.userId);
+                    const results = await DB.all('SELECT * FROM bot_interviews WHERE user_id = ? ORDER BY created_at DESC LIMIT 50', [session.userId]);
                     return sendJson(res, 200, { results });
                 }
 
@@ -689,12 +1516,10 @@ export function vidyaMitraApiPlugin(): Plugin {
                     try {
                         const body = await parseBody(req);
                         const id = generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT INTO bot_interviews (id, user_id, candidate_name, role, conversation_log, feedback, completed_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?)`)
-                            .run(id, session.userId, body.candidateName || '', body.role || '',
+                        await DB.run(`INSERT INTO bot_interviews (id, user_id, candidate_name, role, conversation_log, feedback, completed_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`, [id, session.userId, body.candidateName || '', body.role || '',
                                 JSON.stringify(body.conversationLog || []), JSON.stringify(body.feedback || {}),
-                                body.completedAt || new Date().toISOString());
+                                body.completedAt || new Date().toISOString()]);
                         sendJson(res, 201, { success: true, id });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -710,8 +1535,7 @@ export function vidyaMitraApiPlugin(): Plugin {
                 if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
 
                 if (req.method === 'GET') {
-                    const db = getDb();
-                    const results = db.prepare('SELECT * FROM practice_coding WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').all(session.userId);
+                    const results = await DB.all('SELECT * FROM practice_coding WHERE user_id = ? ORDER BY created_at DESC LIMIT 50', [session.userId]);
                     return sendJson(res, 200, { results });
                 }
 
@@ -719,11 +1543,9 @@ export function vidyaMitraApiPlugin(): Plugin {
                     try {
                         const body = await parseBody(req);
                         const id = body.id || generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT OR REPLACE INTO practice_coding (id, user_id, session_data, date, start_time, end_time)
-              VALUES (?, ?, ?, ?, ?, ?)`)
-                            .run(id, session.userId, JSON.stringify(body), body.date || new Date().toISOString(),
-                                body.startTime || new Date().toISOString(), body.endTime || null);
+                        await DB.run(`INSERT OR REPLACE INTO practice_coding (id, user_id, session_data, date, start_time, end_time)
+              VALUES (?, ?, ?, ?, ?, ?)`, [id, session.userId, JSON.stringify(body), body.date || new Date().toISOString(),
+                                body.startTime || new Date().toISOString(), body.endTime || null]);
                         sendJson(res, 201, { success: true, id });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -739,8 +1561,7 @@ export function vidyaMitraApiPlugin(): Plugin {
                 if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
 
                 if (req.method === 'GET') {
-                    const db = getDb();
-                    const results = db.prepare('SELECT * FROM resumes WHERE user_id = ? ORDER BY created_at DESC').all(session.userId);
+                    const results = await DB.all('SELECT * FROM resumes WHERE user_id = ? ORDER BY created_at DESC', [session.userId]);
                     return sendJson(res, 200, { resumes: results });
                 }
 
@@ -748,12 +1569,10 @@ export function vidyaMitraApiPlugin(): Plugin {
                     try {
                         const body = await parseBody(req);
                         const id = generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT INTO resumes (id, user_id, file_name, raw_text, parsed_data, ats_score, ats_analysis, target_role)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-                            .run(id, session.userId, body.fileName || '', body.rawText || '',
+                        await DB.run(`INSERT INTO resumes (id, user_id, file_name, raw_text, parsed_data, ats_score, ats_analysis, target_role)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [id, session.userId, body.fileName || '', body.rawText || '',
                                 JSON.stringify(body.parsedData || {}), body.atsScore || 0,
-                                JSON.stringify(body.atsAnalysis || {}), body.targetRole || '');
+                                JSON.stringify(body.atsAnalysis || {}), body.targetRole || '']);
                         sendJson(res, 201, { success: true, id });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -769,13 +1588,12 @@ export function vidyaMitraApiPlugin(): Plugin {
                 if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
 
                 if (req.method === 'GET') {
-                    const db = getDb();
                     const params = getQueryParams(req);
                     if (params.get('all') === 'true' && session.isAdmin) {
-                        const results = db.prepare('SELECT * FROM round1_aptitude ORDER BY created_at DESC').all();
+                        const results = await DB.all('SELECT * FROM round1_aptitude ORDER BY created_at DESC', []);
                         return sendJson(res, 200, { results });
                     }
-                    const results = db.prepare('SELECT * FROM round1_aptitude WHERE user_id = ? ORDER BY created_at DESC').all(session.userId);
+                    const results = await DB.all('SELECT * FROM round1_aptitude WHERE user_id = ? ORDER BY created_at DESC', [session.userId]);
                     return sendJson(res, 200, { results });
                 }
 
@@ -783,13 +1601,11 @@ export function vidyaMitraApiPlugin(): Plugin {
                     try {
                         const body = await parseBody(req);
                         const id = generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT INTO round1_aptitude (id, user_id, user_email, user_name, role_id, role_name, score, total_questions, correct_answers, category_performance, completed_at, aborted, abort_reason)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-                            .run(id, session.userId, session.email, session.name, body.roleId || '', body.roleName || '',
+                        await DB.run(`INSERT INTO round1_aptitude (id, user_id, user_email, user_name, role_id, role_name, score, total_questions, correct_answers, category_performance, completed_at, aborted, abort_reason)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [id, session.userId, session.email, session.name, body.roleId || '', body.roleName || '',
                                 body.score || 0, body.totalQuestions || 0, body.correctAnswers || 0,
                                 JSON.stringify(body.categoryPerformance || {}), body.completedAt || new Date().toISOString(),
-                                body.aborted ? 1 : 0, body.abortReason || '');
+                                body.aborted ? 1 : 0, body.abortReason || '']);
                         sendJson(res, 201, { success: true, id });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -803,14 +1619,13 @@ export function vidyaMitraApiPlugin(): Plugin {
                         const path = getUrlPath(req);
                         const idMatch = path.match(/^\/(.+)/);
                         if (idMatch && session.isAdmin) {
-                            const db = getDb();
                             const updates: string[] = [];
                             const values: any[] = [];
                             if (body.selectedForRound2 !== undefined) { updates.push('selected_for_round2 = ?'); values.push(body.selectedForRound2 ? 1 : 0); }
                             if (body.round2EmailSent !== undefined) { updates.push('round2_email_sent = ?'); values.push(body.round2EmailSent ? 1 : 0); }
                             if (updates.length > 0) {
                                 values.push(idMatch[1]);
-                                db.prepare(`UPDATE round1_aptitude SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+                                await DB.run(`UPDATE round1_aptitude SET ${updates.join(', ')} WHERE id = ?`, [...values]);
                             }
                             return sendJson(res, 200, { success: true });
                         }
@@ -820,6 +1635,155 @@ export function vidyaMitraApiPlugin(): Plugin {
                     return;
                 }
                 next();
+            });
+
+            // ==================== AWS SES EMAIL ====================
+            server.middlewares.use('/api/send-round2-email', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                const session = await getSessionAsync(req);
+                if (!session?.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
+
+                try {
+                    const body = await parseBody(req);
+                    const { to_email, to_name, role_name, round1_score } = body;
+
+                    if (!to_email || !to_name || !role_name) {
+                        return sendJson(res, 400, { error: 'to_email, to_name, and role_name are required' });
+                    }
+
+                    // Validate email format
+                    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+                    if (!emailRegex.test(to_email)) {
+                        return sendJson(res, 400, { error: 'Invalid email address format' });
+                    }
+
+                    const fromEmail = resolvedEnv.SES_FROM_EMAIL;
+                    if (!fromEmail) {
+                        return sendJson(res, 503, { error: 'SES_FROM_EMAIL environment variable not set. Please add your verified SES sender email.' });
+                    }
+
+                    const awsRegion = resolvedEnv.AWS_REGION || 'us-east-1';
+                    const sesClient = new SESClient({
+                        region: awsRegion,
+                        credentials: resolvedEnv.AWS_ACCESS_KEY_ID ? {
+                            accessKeyId: resolvedEnv.AWS_ACCESS_KEY_ID,
+                            secretAccessKey: resolvedEnv.AWS_SECRET_ACCESS_KEY,
+                            ...(resolvedEnv.AWS_SESSION_TOKEN ? { sessionToken: resolvedEnv.AWS_SESSION_TOKEN } : {}),
+                        } : undefined,
+                    });
+
+                    const scoreText = round1_score !== undefined ? `\nYour Round 1 Score: ${round1_score}%\n` : '';
+                    const appUrl = `http://localhost:8080`;
+
+                    const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f9f9f9;">
+  <div style="background-color: #ffffff; border-radius: 8px; padding: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+    <div style="text-align: center; margin-bottom: 24px;">
+      <h1 style="color: #2563eb; margin: 0;">VidyaMitra</h1>
+      <p style="color: #6b7280; margin: 4px 0 0 0;">AI-Powered Career Platform</p>
+    </div>
+    <h2 style="color: #1f2937;">🎉 Congratulations, ${to_name}!</h2>
+    <p style="color: #374151; line-height: 1.6;">
+      You have successfully cleared <strong>Round 1 (Aptitude Test)</strong> for the 
+      <strong>${role_name}</strong> position.
+    </p>
+    ${round1_score !== undefined ? `<div style="background-color: #eff6ff; border-left: 4px solid #2563eb; padding: 12px 16px; margin: 16px 0; border-radius: 4px;">
+      <p style="margin: 0; color: #1d4ed8; font-weight: bold;">Round 1 Score: ${round1_score}%</p>
+    </div>` : ''}
+    <p style="color: #374151; line-height: 1.6;">
+      You have been selected to proceed to <strong>Round 2 — Mock Interview</strong>.
+    </p>
+    <p style="color: #374151; line-height: 1.6;">
+      Please log in to your VidyaMitra account and navigate to the <strong>Interview</strong> section 
+      to begin your Round 2 mock interview at your convenience.
+    </p>
+    <div style="text-align: center; margin: 28px 0;">
+      <a href="${appUrl}/login" 
+         style="background-color: #2563eb; color: white; padding: 12px 28px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+        Start Round 2 →
+      </a>
+    </div>
+    <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 24px 0;">
+    <p style="color: #6b7280; font-size: 13px; text-align: center;">
+      Best of luck!<br>
+      <strong>Team VidyaMitra</strong><br>
+      <a href="${appUrl}" style="color: #2563eb;">${appUrl}</a>
+    </p>
+  </div>
+</body>
+</html>`;
+
+                    const textBody = `Congratulations ${to_name}!\n\nYou have successfully cleared Round 1 (Aptitude Test) for the ${role_name} position.${scoreText}\nYou have been selected to proceed to Round 2 — Mock Interview.\n\nPlease log in to your VidyaMitra account and navigate to the Interview section to begin your Round 2 mock interview.\n\n${appUrl}/login\n\nBest of luck!\nTeam VidyaMitra`;
+
+                    const command = new SendEmailCommand({
+                        Destination: { ToAddresses: [to_email.trim()] },
+                        Message: {
+                            Body: {
+                                Html: { Charset: 'UTF-8', Data: emailHtml },
+                                Text: { Charset: 'UTF-8', Data: textBody },
+                            },
+                            Subject: { Charset: 'UTF-8', Data: `🎉 Congratulations! Selected for Round 2 — ${role_name} | VidyaMitra` },
+                        },
+                        Source: fromEmail,
+                    });
+
+                    await sesClient.send(command);
+                    trackSESEmail(); // Track SES email send
+                    console.log(`✅ SES email sent to ${to_email} for ${role_name}`);
+                    return sendJson(res, 200, { success: true, message: `Email sent to ${to_email}` });
+
+                } catch (err: any) {
+                    console.error('❌ SES email error:', err.message, err.code);
+                    let errorMsg = err.message || 'Failed to send email';
+                    if (err.name === 'MessageRejected') errorMsg = 'Email rejected by SES. Check that both sender and recipient emails are verified in SES sandbox mode.';
+                    if (err.name === 'MailFromDomainNotVerifiedException' || err.name === 'EmailAddressNotVerifiedException') errorMsg = 'Sender email is not verified in AWS SES. Please verify SES_FROM_EMAIL in AWS console.';
+                    if (err.name === 'AccessDenied' || err.code === 'AccessDenied') errorMsg = 'AWS credentials do not have SES:SendEmail permission.';
+                    return sendJson(res, 500, { error: errorMsg });
+                }
+            });
+
+            // ==================== ADMIN: SEED MOCK ROUND1 CANDIDATES ====================
+            server.middlewares.use('/api/admin/seed-test-candidates', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                const session = await getSessionAsync(req);
+                if (!session?.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
+
+                const mockCandidates = [
+                    { email: 'kganeshram15@gmail.com',     name: 'Ganesh Ram K',       roleId: 'swe',      roleName: 'Software Engineer',     score: 88, correct: 22, total: 25 },
+                    { email: 's.yuvashakthiraj@gmail.com', name: 'Yuva Shakthi Raj S', roleId: 'ds',       roleName: 'Data Scientist',        score: 76, correct: 19, total: 25 },
+                    { email: 'girikdharan2006@gmail.com',  name: 'Girik Dharan',       roleId: 'fe',       roleName: 'Frontend Developer',    score: 72, correct: 18, total: 25 },
+                    { email: 'kganeshram05@gmail.com',     name: 'Ganesh Ram (2)',      roleId: 'be',       roleName: 'Backend Developer',     score: 84, correct: 21, total: 25 },
+                    { email: 'thericksmart@gmail.com',     name: 'Rick Smart',         roleId: 'fs',       roleName: 'Full Stack Developer',  score: 92, correct: 23, total: 25 },
+                    { email: 'sidarthdhoni@gmail.com',     name: 'Sidarth Dhoni',      roleId: 'devops',   roleName: 'DevOps Engineer',       score: 68, correct: 17, total: 25 },
+                ];
+
+                try {
+                    let inserted = 0;
+                    let skipped = 0;
+                    for (const c of mockCandidates) {
+                        // Skip if this mock email already has a round1 record
+                        const existing: any = await DB.get('SELECT id FROM round1_aptitude WHERE user_email = ? AND user_name = ?', [c.email, c.name]);
+                        if (existing) { skipped++; continue; }
+
+                        const id = generateId();
+                        const completedAt = new Date(Date.now() - Math.floor(Math.random() * 3 * 24 * 60 * 60 * 1000)).toISOString();
+                        await DB.run(
+                            `INSERT INTO round1_aptitude (id, user_id, user_email, user_name, role_id, role_name, score, total_questions, correct_answers, category_performance, completed_at, aborted, abort_reason)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            ['mock-' + id, 'mock-user-' + id, c.email, c.name, c.roleId, c.roleName, c.score, c.total, c.correct,
+                             JSON.stringify({ 'Logical Reasoning': { correct: Math.floor(c.correct * 0.4), total: 10, percentage: Math.round(c.score * 0.9) }, 'Quantitative': { correct: Math.floor(c.correct * 0.36), total: 9, percentage: Math.round(c.score * 1.0) }, 'Verbal': { correct: Math.floor(c.correct * 0.24), total: 6, percentage: Math.round(c.score * 1.1) } }),
+                             completedAt, 0, null]
+                        );
+                        inserted++;
+                    }
+                    return sendJson(res, 200, { success: true, inserted, skipped, message: `${inserted} mock candidates seeded, ${skipped} already existed.` });
+                } catch (err: any) {
+                    console.error('Seed error:', err.message);
+                    return sendJson(res, 500, { error: err.message });
+                }
             });
 
             // ==================== CAREER PLAN ====================
@@ -892,11 +1856,9 @@ Return ONLY valid JSON.`;
 
                         // Save plan
                         const id = generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT INTO career_plans (id, user_id, target_role, skill_gaps, training_plan, youtube_videos, pexels_images)
-              VALUES (?, ?, ?, ?, ?, ?, ?)`)
-                            .run(id, session.userId, targetRole, JSON.stringify(skillGaps || []),
-                                JSON.stringify(trainingPlan), JSON.stringify(allVideos), JSON.stringify(images));
+                        await DB.run(`INSERT INTO career_plans (id, user_id, target_role, skill_gaps, training_plan, youtube_videos, pexels_images)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`, [id, session.userId, targetRole, JSON.stringify(skillGaps || []),
+                                JSON.stringify(trainingPlan), JSON.stringify(allVideos), JSON.stringify(images)]);
 
                         sendJson(res, 200, { success: true, id, trainingPlan, videos: allVideos, images });
                     } catch (err: any) {
@@ -906,8 +1868,7 @@ Return ONLY valid JSON.`;
                 }
 
                 if (req.method === 'GET') {
-                    const db = getDb();
-                    const plans = db.prepare('SELECT * FROM career_plans WHERE user_id = ? ORDER BY created_at DESC').all(session.userId);
+                    const plans = await DB.all('SELECT * FROM career_plans WHERE user_id = ? ORDER BY created_at DESC', [session.userId]);
                     return sendJson(res, 200, { plans });
                 }
                 next();
@@ -993,6 +1954,430 @@ Generate the Mermaid code now for the ${targetRole} roadmap:`;
                 }
             });
 
+            // ==================== PROFILE SYSTEM ====================
+            // Helper: auto-create profile for user if it doesn't exist
+            async function ensureUserProfile(userId: string): Promise<any> {
+                let profile = await DB.get('SELECT * FROM user_profiles WHERE user_id = ?', [userId]) as any;
+                if (!profile) {
+                    const id = generateId();
+                    await DB.run(`INSERT INTO user_profiles (id, user_id) VALUES (?, ?)`, [id, userId]);
+                    profile = await DB.get('SELECT * FROM user_profiles WHERE user_id = ?', [userId]);
+                }
+                return profile;
+            }
+
+            // Helper: fetch user by ID with parsed skills (avoids repeating the same SELECT + safeParse)
+            async function getUserById(userId: string): Promise<any> {
+                const user = await DB.get('SELECT id, email, name, target_role, skills, phone, location, bio, github_url, linkedin_url, leetcode_url, profile_picture, created_at FROM users WHERE id = ?', [userId]) as any;
+                if (user) {
+                    user.skills = safeParse(user.skills, []);
+                }
+                return user;
+            }
+
+            // GET /api/profile/statistics - Get user stats across all tables
+            server.middlewares.use('/api/profile/statistics', async (req: any, res: any, next: any) => {
+                if (req.method !== 'GET') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                try {
+                    const totalInterviews = ((await DB.get('SELECT COUNT(*) as c FROM interviews WHERE user_id = ?', [session.userId])) as any)?.c || 0;
+                    const totalPracticeSessions = (
+                        ((await DB.get('SELECT COUNT(*) as c FROM practice_interviews WHERE user_id = ?', [session.userId])) as any)?.c || 0
+                    ) + (
+                        ((await DB.get('SELECT COUNT(*) as c FROM practice_aptitude WHERE user_id = ?', [session.userId])) as any)?.c || 0
+                    ) + (
+                        ((await DB.get('SELECT COUNT(*) as c FROM bot_interviews WHERE user_id = ?', [session.userId])) as any)?.c || 0
+                    );
+                    const totalAnalyses = ((await DB.get('SELECT COUNT(*) as c FROM profile_analyses WHERE user_id = ?', [session.userId])) as any)?.c || 0;
+                    const totalResumeBuilds = ((await DB.get('SELECT COUNT(*) as c FROM resume_builds WHERE user_id = ?', [session.userId])) as any)?.c || 0;
+                    const totalCareerPlans = ((await DB.get('SELECT COUNT(*) as c FROM career_plans WHERE user_id = ?', [session.userId])) as any)?.c || 0;
+
+                    sendJson(res, 200, {
+                        statistics: {
+                            totalInterviews,
+                            totalPracticeSessions,
+                            totalAnalyses,
+                            totalResumeBuilds,
+                            totalCareerPlans,
+                        },
+                    });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            server.middlewares.use('/api/profile/resume', async (req: any, res: any, next: any) => {
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+
+                // POST - Save resume to profile
+                if (req.method === 'POST') {
+                    try {
+                        // Parse body with larger limit for resume data (10MB)
+                        let body: any;
+                        try {
+                            body = await new Promise((resolve, reject) => {
+                                let raw = '';
+                                req.on('data', (chunk: Buffer) => {
+                                    raw += chunk.toString();
+                                    if (raw.length > 10 * 1024 * 1024) reject(new Error('Resume body too large'));
+                                });
+                                req.on('end', () => {
+                                    try { resolve(raw ? JSON.parse(raw) : {}); }
+                                    catch { reject(new Error('Invalid JSON in resume body')); }
+                                });
+                                req.on('error', reject);
+                            });
+                        } catch (parseErr: any) {
+                            return sendJson(res, 400, { error: parseErr.message || 'Failed to parse resume body' });
+                        }
+
+                        const resume = body?.resume;
+                        if (!resume || typeof resume !== 'object') {
+                            return sendJson(res, 400, { error: 'resume object required in body' });
+                        }
+
+                        // ── Safely normalize every field ──
+                        const safeId: string = (typeof resume.id === 'string' && resume.id) ? resume.id : generateId();
+                        const safeName: string = (typeof resume.name === 'string') ? resume.name.substring(0, 500) : '';
+                        // Limit text to 500KB to avoid DB bloat from binary PDF garbage
+                        let safeText: string = (typeof resume.text === 'string') ? resume.text : '';
+                        if (safeText.length > 500000) safeText = safeText.substring(0, 500000);
+                        const safeSkills: string[] = Array.isArray(resume.skills) ? resume.skills.filter((s: any) => typeof s === 'string') : [];
+                        const safeAtsScore: number = (typeof resume.ats_score === 'number' && !isNaN(resume.ats_score)) ? resume.ats_score : 0;
+                        const safeParsedData: Record<string, any> = (resume.parsed_data && typeof resume.parsed_data === 'object' && !Array.isArray(resume.parsed_data)) ? resume.parsed_data : {};
+                        const safeUploadedAt: string = (typeof resume.uploaded_at === 'string' && resume.uploaded_at) ? resume.uploaded_at : new Date().toISOString();
+
+                        // Safely extract education & experience from parsed_data
+                        const educationSummary: string | null = (typeof safeParsedData.education === 'string') ? safeParsedData.education.substring(0, 2000) :
+                            Array.isArray(safeParsedData.education) ? JSON.stringify(safeParsedData.education).substring(0, 2000) : null;
+                        const experienceSummary: string | null = (typeof safeParsedData.experience === 'string') ? safeParsedData.experience.substring(0, 2000) :
+                            Array.isArray(safeParsedData.experience) ? JSON.stringify(safeParsedData.experience).substring(0, 2000) : null;
+
+                        await ensureUserProfile(session.userId);
+
+                        // Save resume data to user_profiles
+                        await DB.run(`UPDATE user_profiles SET
+                            saved_resume_id = ?,
+                            saved_resume_name = ?,
+                            saved_resume_text = ?,
+                            saved_resume_skills = ?,
+                            saved_resume_ats_score = ?,
+                            saved_resume_parsed_data = ?,
+                            last_resume_upload = ?,
+                            education_summary = ?,
+                            experience_summary = ?,
+                            updated_at = datetime('now')
+                            WHERE user_id = ?`, [safeId,
+                            safeName,
+                            safeText,
+                            JSON.stringify(safeSkills),
+                            safeAtsScore,
+                            JSON.stringify(safeParsedData),
+                            safeUploadedAt,
+                            educationSummary,
+                            experienceSummary,
+                            session.userId]);
+
+                        // ── Auto-fill user profile from resume data (don't overwrite existing) ──
+                        const currentUser = await getUserById(session.userId);
+                        const autoFillUpdates: string[] = [];
+                        const autoFillValues: any[] = [];
+
+                        // Auto-fill skills (merge, don't overwrite)
+                        if (safeSkills.length > 0) {
+                            const existingSkills: string[] = Array.isArray(currentUser?.skills) ? currentUser.skills : [];
+                            const merged = [...new Set([...existingSkills, ...safeSkills])];
+                            autoFillUpdates.push('skills = ?');
+                            autoFillValues.push(JSON.stringify(merged));
+                        }
+
+                        // Auto-fill phone if user has none
+                        const extractedPhone = safeParsedData.phone ?? null;
+                        if (extractedPhone && typeof extractedPhone === 'string' && !currentUser?.phone) {
+                            autoFillUpdates.push('phone = ?');
+                            autoFillValues.push(extractedPhone);
+                        }
+
+                        // Auto-fill name if user has none
+                        const extractedName = safeParsedData.name ?? null;
+                        if (extractedName && typeof extractedName === 'string' && !currentUser?.name) {
+                            autoFillUpdates.push('name = ?');
+                            autoFillValues.push(extractedName);
+                        }
+
+                        if (autoFillUpdates.length > 0) {
+                            autoFillUpdates.push("updated_at = datetime('now')");
+                            autoFillValues.push(session.userId);
+                            await DB.run(`UPDATE users SET ${autoFillUpdates.join(', ')} WHERE id = ?`, [...autoFillValues]);
+                        }
+
+                        // Return updated profile + user
+                        const updatedProfile = await DB.get('SELECT * FROM user_profiles WHERE user_id = ?', [session.userId]) as any;
+                        const updatedUser = await getUserById(session.userId);
+                        const parsedProfile = updatedProfile ? {
+                            ...updatedProfile,
+                            saved_resume_skills: safeParse(updatedProfile.saved_resume_skills, []),
+                            saved_resume_parsed_data: safeParse(updatedProfile.saved_resume_parsed_data, {}),
+                            preferences: safeParse(updatedProfile.preferences, {}),
+                        } : null;
+                        sendJson(res, 200, { profile: parsedProfile, user: updatedUser });
+                    } catch (err: any) {
+                        console.error('POST /api/profile/resume error:', err);
+                        sendJson(res, 500, { error: err.message || 'Failed to save resume' });
+                    }
+                    return;
+                }
+
+                // GET - Load resume from profile
+                if (req.method === 'GET') {
+                    try {
+                        const profile = await ensureUserProfile(session.userId);
+                        if (!profile.saved_resume_id) {
+                            return sendJson(res, 200, { resume: null });
+                        }
+
+                        const resume = {
+                            id: profile.saved_resume_id,
+                            name: profile.saved_resume_name,
+                            text: profile.saved_resume_text,
+                            skills: safeParse(profile.saved_resume_skills, []),
+                            ats_score: profile.saved_resume_ats_score,
+                            parsed_data: safeParse(profile.saved_resume_parsed_data, {}),
+                            uploaded_at: profile.last_resume_upload,
+                        };
+                        sendJson(res, 200, { resume });
+                    } catch (err: any) {
+                        sendJson(res, 500, { error: err.message });
+                    }
+                    return;
+                }
+
+                // DELETE - Delete resume from profile
+                if (req.method === 'DELETE') {
+                    try {
+                        await ensureUserProfile(session.userId);
+                        await DB.run(`UPDATE user_profiles SET
+                            saved_resume_id = NULL,
+                            saved_resume_name = NULL,
+                            saved_resume_text = NULL,
+                            saved_resume_skills = '[]',
+                            saved_resume_ats_score = NULL,
+                            saved_resume_parsed_data = '{}',
+                            last_resume_upload = NULL,
+                            updated_at = datetime('now')
+                            WHERE user_id = ?`, [session.userId]);
+                        sendJson(res, 200, { success: true });
+                    } catch (err: any) {
+                        sendJson(res, 500, { error: err.message });
+                    }
+                    return;
+                }
+
+                next();
+            });
+
+            server.middlewares.use('/api/profile/analyses', async (req: any, res: any, next: any) => {
+                if (req.method !== 'GET') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                try {
+                    const rows = await DB.all('SELECT * FROM profile_analyses WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', [session.userId]);
+                    const analyses = (rows as any[]).map((r: any) => ({
+                        ...r,
+                        analysis_data: safeParse(r.analysis_data, {}),
+                    }));
+                    sendJson(res, 200, { analyses });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            server.middlewares.use('/api/profile/analysis', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                try {
+                    const { analysis } = await parseBody(req);
+                    if (!analysis) return sendJson(res, 400, { error: 'analysis data required' });
+
+                    const id = analysis.id || generateId();
+                    await DB.run(`INSERT INTO profile_analyses (id, user_id, analysis_type, analysis_data, score, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)`, [id,
+                        session.userId,
+                        analysis.analysis_type || 'general',
+                        JSON.stringify(analysis.analysis_data || {}),
+                        analysis.score || null,
+                        analysis.status || 'completed',
+                        analysis.created_at || new Date().toISOString()]);
+
+                    // Increment analyses counter
+                    await ensureUserProfile(session.userId);
+                    await DB.run(`UPDATE user_profiles SET total_analyses = total_analyses + 1, updated_at = datetime('now') WHERE user_id = ?`, [session.userId]);
+
+                    sendJson(res, 201, { analysis: { id, ...analysis, user_id: session.userId } });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            server.middlewares.use('/api/profile/activity', async (req: any, res: any, next: any) => {
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                // POST - Log new activity
+                if (req.method === 'POST') {
+                    try {
+                        const { activity } = await parseBody(req);
+                        if (!activity) return sendJson(res, 400, { error: 'activity data required' });
+
+                        const id = activity.id || generateId();
+                        await DB.run(`INSERT INTO user_activities (id, user_id, activity_type, activity_title, activity_description, metadata, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)`, [id,
+                            session.userId,
+                            activity.activity_type || 'general',
+                            activity.activity_title || 'Activity',
+                            activity.activity_description || '',
+                            JSON.stringify(activity.metadata || {}),
+                            activity.created_at || new Date().toISOString()]);
+
+                        sendJson(res, 201, { activity: { id, ...activity, user_id: session.userId } });
+                    } catch (err: any) {
+                        sendJson(res, 500, { error: err.message });
+                    }
+                    return;
+                }
+
+                // GET - Get activity history
+                if (req.method === 'GET') {
+                    try {
+                        const params = getQueryParams(req);
+                        const limit = parseInt(params.get('limit') || '50');
+                        const rows = await DB.all('SELECT * FROM user_activities WHERE user_id = ? ORDER BY created_at DESC LIMIT ?', [session.userId, limit]);
+                        const activities = (rows as any[]).map((r: any) => ({
+                            ...r,
+                            metadata: safeParse(r.metadata, {}),
+                        }));
+                        sendJson(res, 200, { activities });
+                    } catch (err: any) {
+                        sendJson(res, 500, { error: err.message });
+                    }
+                    return;
+                }
+
+                next();
+            });
+
+            server.middlewares.use('/api/profile/info', async (req: any, res: any, next: any) => {
+                if (req.method !== 'PUT') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                try {
+                    const { updates } = await parseBody(req);
+                    if (!updates) return sendJson(res, 400, { error: 'updates required' });
+
+                    const allowedFields = ['name', 'phone', 'location', 'bio', 'github_url', 'linkedin_url', 'leetcode_url', 'profile_picture', 'target_role'];
+                    const setClauses: string[] = [];
+                    const values: any[] = [];
+
+                    for (const field of allowedFields) {
+                        if (updates[field] !== undefined) {
+                            setClauses.push(`${field} = ?`);
+                            values.push(updates[field]);
+                        }
+                    }
+
+                    if (updates.skills !== undefined) {
+                        setClauses.push('skills = ?');
+                        values.push(JSON.stringify(updates.skills));
+                    }
+
+                    if (setClauses.length > 0) {
+                        setClauses.push("updated_at = datetime('now')");
+                        values.push(session.userId);
+                        await DB.run(`UPDATE users SET ${setClauses.join(', ')} WHERE id = ?`, [...values]);
+                    }
+
+                    const user = await getUserById(session.userId);
+                    sendJson(res, 200, { user });
+                } catch (err: any) {
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            server.middlewares.use('/api/profile', async (req: any, res: any, next: any) => {
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+
+                // GET - Get or auto-create profile
+                if (req.method === 'GET') {
+                    try {
+                        const profile = await ensureUserProfile(session.userId);
+                        const user = await getUserById(session.userId);
+
+                        // Also parse profile JSON fields
+                        const parsedProfile = {
+                            ...profile,
+                            saved_resume_skills: safeParse(profile.saved_resume_skills, []),
+                            saved_resume_parsed_data: safeParse(profile.saved_resume_parsed_data, {}),
+                            preferences: safeParse(profile.preferences, {}),
+                        };
+
+                        sendJson(res, 200, { profile: parsedProfile, user });
+                    } catch (err: any) {
+                        sendJson(res, 500, { error: err.message });
+                    }
+                    return;
+                }
+
+                // PUT - Update profile
+                if (req.method === 'PUT') {
+                    try {
+                        const { updates } = await parseBody(req);
+                        if (!updates) return sendJson(res, 400, { error: 'updates required' });
+
+                        await ensureUserProfile(session.userId);
+
+                        const allowedProfileFields = ['preferred_role', 'career_goals', 'total_interviews', 'total_practice_sessions', 'total_analyses'];
+                        const setClauses: string[] = [];
+                        const values: any[] = [];
+
+                        for (const field of allowedProfileFields) {
+                            if (updates[field] !== undefined) {
+                                setClauses.push(`${field} = ?`);
+                                values.push(updates[field]);
+                            }
+                        }
+
+                        if (updates.preferences !== undefined) {
+                            setClauses.push('preferences = ?');
+                            values.push(JSON.stringify(updates.preferences));
+                        }
+
+                        if (setClauses.length > 0) {
+                            setClauses.push("updated_at = datetime('now')");
+                            values.push(session.userId);
+                            await DB.run(`UPDATE user_profiles SET ${setClauses.join(', ')} WHERE user_id = ?`, [...values]);
+                        }
+
+                        const profile = await DB.get('SELECT * FROM user_profiles WHERE user_id = ?', [session.userId]);
+                        sendJson(res, 200, { profile });
+                    } catch (err: any) {
+                        sendJson(res, 500, { error: err.message });
+                    }
+                    return;
+                }
+
+                next();
+            });
+
             // ==================== RESUME BUILDER ====================
             server.middlewares.use('/api/resume-builder', async (req: any, res: any, next: any) => {
                 const session = getSession(req);
@@ -1002,13 +2387,11 @@ Generate the Mermaid code now for the ${targetRole} roadmap:`;
                     try {
                         const body = await parseBody(req);
                         const id = body.id || generateId();
-                        const db = getDb();
-                        db.prepare(`INSERT OR REPLACE INTO resume_builds (id, user_id, personal_info, education, experience, projects, skills, template, ats_score, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`)
-                            .run(id, session.userId, JSON.stringify(body.personalInfo || {}),
+                        await DB.run(`INSERT OR REPLACE INTO resume_builds (id, user_id, personal_info, education, experience, projects, skills, template, ats_score, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`, [id, session.userId, JSON.stringify(body.personalInfo || {}),
                                 JSON.stringify(body.education || []), JSON.stringify(body.experience || []),
                                 JSON.stringify(body.projects || []), JSON.stringify(body.skills || []),
-                                body.template || 'modern', body.atsScore || 0);
+                                body.template || 'modern', body.atsScore || 0]);
                         sendJson(res, 201, { success: true, id });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -1017,8 +2400,7 @@ Generate the Mermaid code now for the ${targetRole} roadmap:`;
                 }
 
                 if (req.method === 'GET') {
-                    const db = getDb();
-                    const builds = db.prepare('SELECT * FROM resume_builds WHERE user_id = ? ORDER BY updated_at DESC').all(session.userId);
+                    const builds = await DB.all('SELECT * FROM resume_builds WHERE user_id = ? ORDER BY updated_at DESC', [session.userId]);
                     return sendJson(res, 200, { builds });
                 }
                 next();
@@ -1029,8 +2411,7 @@ Generate the Mermaid code now for the ${targetRole} roadmap:`;
                 if (req.method !== 'GET') return next();
                 const session = getSession(req);
                 if (!session || !session.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
-                const db = getDb();
-                const users = db.prepare('SELECT id, email, name, is_admin, created_at FROM users ORDER BY created_at DESC').all();
+                const users = await DB.all('SELECT id, email, name, is_admin, created_at FROM users ORDER BY created_at DESC', []);
                 sendJson(res, 200, { users });
             });
 
@@ -1039,19 +2420,105 @@ Generate the Mermaid code now for the ${targetRole} roadmap:`;
                 if (req.method !== 'GET') return next();
                 const session = getSession(req);
                 if (!session || !session.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
-                const db = getDb();
-                const totalUsers = (db.prepare('SELECT COUNT(*) as count FROM users').get() as any).count;
-                const totalInterviews = (db.prepare('SELECT COUNT(*) as count FROM interviews').get() as any).count;
-                const completedInterviews = (db.prepare('SELECT COUNT(*) as count FROM interviews WHERE completed = 1').get() as any).count;
-                const avgScore = (db.prepare('SELECT AVG(score) as avg FROM interviews WHERE completed = 1 AND score IS NOT NULL').get() as any).avg || 0;
-                sendJson(res, 200, { totalUsers, totalInterviews, completedInterviews, averageScore: Math.round(avgScore * 10) / 10 });
+                const totalUsers = (await DB.get('SELECT COUNT(*) as count FROM users', []) as any).count;
+
+                // Formal mock interviews
+                const totalInterviews = (await DB.get('SELECT COUNT(*) as count FROM interviews', []) as any).count;
+                const completedInterviews = (await DB.get('SELECT COUNT(*) as count FROM interviews WHERE completed = 1', []) as any).count;
+                const avgScore = (await DB.get('SELECT AVG(score) as avg FROM interviews WHERE completed = 1 AND score IS NOT NULL', []) as any).avg || 0;
+
+                // Round 1 Aptitude
+                const totalRound1 = (await DB.get('SELECT COUNT(*) as count FROM round1_aptitude', []) as any).count;
+
+                // Bot Interviews
+                const totalBotInterviews = (await DB.get('SELECT COUNT(*) as count FROM bot_interviews', []) as any).count;
+
+                // Practice Interviews
+                const totalPracticeInterviews = (await DB.get('SELECT COUNT(*) as count FROM practice_interviews', []) as any).count;
+
+                // Practice Aptitude
+                const totalPracticeAptitude = (await DB.get('SELECT COUNT(*) as count FROM practice_aptitude', []) as any).count;
+
+                // Practice Coding
+                const totalPracticeCoding = (await DB.get('SELECT COUNT(*) as count FROM practice_coding', []) as any).count;
+
+                // Resumes saved in profiles
+                let totalResumes = 0;
+                try {
+                    totalResumes = (await DB.get("SELECT COUNT(*) as count FROM user_profiles WHERE saved_resume_name IS NOT NULL AND saved_resume_name != ''", []) as any).count;
+                } catch { /* table might not exist */ }
+
+                // Recent activity across all tables (last 10 items)
+                const recentActivity: any[] = [];
+                try {
+                    const recentInterviews = await DB.all('SELECT id, role_name, user_id, date, completed FROM interviews ORDER BY date DESC LIMIT 5', []) as any[];
+                    recentInterviews.forEach((r: any) => recentActivity.push({ type: 'interview', id: r.id, roleName: r.role_name, userId: r.user_id, date: r.date, completed: r.completed }));
+                } catch { }
+                try {
+                    const recentRound1 = await DB.all('SELECT id, role_name, user_id, user_email, score, submitted_at FROM round1_aptitude ORDER BY submitted_at DESC LIMIT 5', []) as any[];
+                    recentRound1.forEach((r: any) => recentActivity.push({ type: 'round1', id: r.id, roleName: r.role_name, userId: r.user_id, userEmail: r.user_email, score: r.score, date: r.submitted_at }));
+                } catch { }
+                try {
+                    const recentBot = await DB.all('SELECT id, role, user_id, completed_at FROM bot_interviews ORDER BY completed_at DESC LIMIT 5', []) as any[];
+                    recentBot.forEach((r: any) => recentActivity.push({ type: 'bot_interview', id: r.id, roleName: r.role, userId: r.user_id, date: r.completed_at }));
+                } catch { }
+                try {
+                    const recentPractice = await DB.all('SELECT id, role_name, user_id, overall_score, completed_at FROM practice_interviews ORDER BY completed_at DESC LIMIT 5', []) as any[];
+                    recentPractice.forEach((r: any) => recentActivity.push({ type: 'practice_interview', id: r.id, roleName: r.role_name, userId: r.user_id, score: r.overall_score, date: r.completed_at }));
+                } catch { }
+                try {
+                    const recentPracticeApt = await DB.all('SELECT id, user_id, score, completed_at FROM practice_aptitude ORDER BY completed_at DESC LIMIT 5', []) as any[];
+                    recentPracticeApt.forEach((r: any) => recentActivity.push({ type: 'practice_aptitude', id: r.id, userId: r.user_id, score: r.score, date: r.completed_at }));
+                } catch { }
+
+                // Sort by date descending and take top 10
+                recentActivity.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+                // Build role popularity map across all sources
+                const roleCountMap: Record<string, number> = {};
+                try {
+                    const roleCounts = await DB.all('SELECT role_name, COUNT(*) as cnt FROM interviews GROUP BY role_name', []) as any[];
+                    roleCounts.forEach((r: any) => { if (r.role_name) roleCountMap[r.role_name] = (roleCountMap[r.role_name] || 0) + r.cnt; });
+                } catch { }
+                try {
+                    const r1Counts = await DB.all('SELECT role_name, COUNT(*) as cnt FROM round1_aptitude GROUP BY role_name', []) as any[];
+                    r1Counts.forEach((r: any) => { if (r.role_name) roleCountMap[r.role_name] = (roleCountMap[r.role_name] || 0) + r.cnt; });
+                } catch { }
+                try {
+                    const botCounts = await DB.all('SELECT role, COUNT(*) as cnt FROM bot_interviews GROUP BY role', []) as any[];
+                    botCounts.forEach((r: any) => { if (r.role) roleCountMap[r.role] = (roleCountMap[r.role] || 0) + r.cnt; });
+                } catch { }
+                try {
+                    const pracCounts = await DB.all('SELECT role_name, COUNT(*) as cnt FROM practice_interviews GROUP BY role_name', []) as any[];
+                    pracCounts.forEach((r: any) => { if (r.role_name) roleCountMap[r.role_name] = (roleCountMap[r.role_name] || 0) + r.cnt; });
+                } catch { }
+
+                const popularRoles = Object.entries(roleCountMap)
+                    .map(([role, count]) => ({ role, count }))
+                    .sort((a, b) => b.count - a.count)
+                    .slice(0, 5);
+
+                sendJson(res, 200, {
+                    totalUsers,
+                    totalInterviews,
+                    completedInterviews,
+                    averageScore: Math.round(avgScore * 10) / 10,
+                    totalRound1,
+                    totalBotInterviews,
+                    totalPracticeInterviews,
+                    totalPracticeAptitude,
+                    totalPracticeCoding,
+                    totalResumes,
+                    totalAllActivities: totalInterviews + totalRound1 + totalBotInterviews + totalPracticeInterviews + totalPracticeAptitude + totalPracticeCoding,
+                    recentActivity: recentActivity.slice(0, 10),
+                    popularRoles,
+                });
             });
 
             // ==================== ROLES ====================
             server.middlewares.use('/api/roles', async (req: any, res: any, next: any) => {
-                const db = getDb();
                 if (req.method === 'GET') {
-                    const roles = db.prepare('SELECT * FROM roles').all();
+                    const roles = await DB.all('SELECT * FROM roles', []);
                     return sendJson(res, 200, { roles });
                 }
                 if (req.method === 'POST') {
@@ -1060,8 +2527,7 @@ Generate the Mermaid code now for the ${targetRole} roadmap:`;
                     try {
                         const { roleId, isOpen } = await parseBody(req);
                         const id = generateId();
-                        db.prepare(`INSERT OR REPLACE INTO roles (id, role_id, is_open, updated_at) VALUES (?, ?, ?, datetime('now'))`)
-                            .run(id, roleId, isOpen ? 1 : 0);
+                        await DB.run(`INSERT OR REPLACE INTO roles (id, role_id, is_open, updated_at) VALUES (?, ?, ?, datetime('now'))`, [id, roleId, isOpen ? 1 : 0]);
                         sendJson(res, 200, { success: true });
                     } catch (err: any) {
                         sendJson(res, 500, { error: err.message });
@@ -1069,6 +2535,1309 @@ Generate the Mermaid code now for the ${targetRole} roadmap:`;
                     return;
                 }
                 next();
+            });
+
+            // ==================== JUDGE0 CODE EXECUTION PROXY ====================
+            // Primary: self-hosted AWS instance. Fallback: RapidAPI.
+            // All Judge0 credentials stay server-side (no VITE_ prefix).
+
+            server.middlewares.use('/api/judge0/submit', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                // Rate limit: 10 submissions/min per user
+                const rateCheck = checkAndRecordRate(`judge0_${session.userId}`, 10, 500);
+                if (!rateCheck.ok) return sendJson(res, 429, { error: rateCheck.error });
+
+                try {
+                    const body = await parseBody(req);
+                    const { source_code, language_id, stdin, cpu_time_limit, memory_limit } = body;
+
+                    if (!source_code || !language_id) {
+                        return sendJson(res, 400, { error: 'source_code and language_id are required' });
+                    }
+
+                    const submission = {
+                        source_code,
+                        language_id,
+                        stdin: stdin || undefined,
+                        cpu_time_limit: cpu_time_limit || 10,
+                        memory_limit: memory_limit || 256000,
+                    };
+
+                    // Try self-hosted AWS instance first
+                    if (keys.JUDGE0_HOST) {
+                        try {
+                            const awsRes = await fetch(
+                                `${keys.JUDGE0_HOST}/submissions?base64_encoded=true&wait=false`,
+                                {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify(submission),
+                                    signal: AbortSignal.timeout(8000),
+                                }
+                            );
+                            if (awsRes.ok) {
+                                const data = await awsRes.json();
+                                console.log(`✅ Judge0 submission via AWS: token=${data.token}`);
+                                return sendJson(res, 200, { token: data.token, provider: 'aws' });
+                            }
+                            console.warn(`⚠️ AWS Judge0 submit failed (${awsRes.status}), falling back to RapidAPI`);
+                        } catch (awsErr: any) {
+                            console.warn(`⚠️ AWS Judge0 unreachable: ${awsErr.message}, falling back to RapidAPI`);
+                        }
+                    }
+
+                    // Fallback: RapidAPI
+                    if (keys.JUDGE0_RAPIDAPI_KEY && keys.JUDGE0_RAPIDAPI_URL) {
+                        const rapidRes = await fetch(
+                            `${keys.JUDGE0_RAPIDAPI_URL}/submissions?base64_encoded=true&wait=false`,
+                            {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'x-rapidapi-key': keys.JUDGE0_RAPIDAPI_KEY,
+                                    'x-rapidapi-host': keys.JUDGE0_RAPIDAPI_HOST,
+                                },
+                                body: JSON.stringify(submission),
+                            }
+                        );
+                        if (!rapidRes.ok) {
+                            const errText = await rapidRes.text();
+                            return sendJson(res, rapidRes.status, { error: `Judge0 RapidAPI error: ${errText}` });
+                        }
+                        const data = await rapidRes.json();
+                        console.log(`✅ Judge0 submission via RapidAPI: token=${data.token}`);
+                        return sendJson(res, 200, { token: data.token, provider: 'rapidapi' });
+                    }
+
+                    sendJson(res, 503, { error: 'No Judge0 provider available. Configure JUDGE0_HOST or JUDGE0_RAPIDAPI_KEY.' });
+                } catch (err: any) {
+                    console.error('❌ Judge0 submit error:', err.message);
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            server.middlewares.use('/api/judge0/result/', async (req: any, res: any, next: any) => {
+                if (req.method !== 'GET') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+
+                // Extract token from URL: /api/judge0/result/<token>?provider=aws
+                const urlPath = getUrlPath(req);
+                const token = urlPath.replace('/api/judge0/result/', '').replace(/\/$/, '');
+                if (!token) return sendJson(res, 400, { error: 'Token is required' });
+
+                const params = getQueryParams(req);
+                const provider = params.get('provider') || 'aws';
+
+                try {
+                    // Try the same provider that was used for submission
+                    if (provider === 'aws' && keys.JUDGE0_HOST) {
+                        try {
+                            const awsRes = await fetch(
+                                `${keys.JUDGE0_HOST}/submissions/${token}?base64_encoded=true&fields=*`,
+                                {
+                                    method: 'GET',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    signal: AbortSignal.timeout(8000),
+                                }
+                            );
+                            if (awsRes.ok) {
+                                const data = await awsRes.json();
+                                return sendJson(res, 200, data);
+                            }
+                            console.warn(`⚠️ AWS Judge0 result poll failed (${awsRes.status}), trying RapidAPI`);
+                        } catch (awsErr: any) {
+                            console.warn(`⚠️ AWS Judge0 result unreachable: ${awsErr.message}`);
+                        }
+                    }
+
+                    // Fallback or RapidAPI provider
+                    if (keys.JUDGE0_RAPIDAPI_KEY && keys.JUDGE0_RAPIDAPI_URL) {
+                        const rapidRes = await fetch(
+                            `${keys.JUDGE0_RAPIDAPI_URL}/submissions/${token}?base64_encoded=true&fields=*`,
+                            {
+                                method: 'GET',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'x-rapidapi-key': keys.JUDGE0_RAPIDAPI_KEY,
+                                    'x-rapidapi-host': keys.JUDGE0_RAPIDAPI_HOST,
+                                },
+                            }
+                        );
+                        if (!rapidRes.ok) {
+                            const errText = await rapidRes.text();
+                            return sendJson(res, rapidRes.status, { error: `Judge0 result error: ${errText}` });
+                        }
+                        const data = await rapidRes.json();
+                        return sendJson(res, 200, data);
+                    }
+
+                    sendJson(res, 503, { error: 'No Judge0 provider available' });
+                } catch (err: any) {
+                    console.error('❌ Judge0 result error:', err.message);
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // ==================== ELEVENLABS SIGNED URL ====================
+            server.middlewares.use('/api/elevenlabs-signed-url', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+
+                if (!keys.ELEVENLABS_API_KEY) {
+                    return sendJson(res, 500, { error: 'ElevenLabs API key not configured' });
+                }
+
+                // Rate limit: max 3 signed URLs per minute
+                const rateCheck = checkAndRecordRate('elevenlabs', 3, 50);
+                if (!rateCheck.ok) {
+                    return sendJson(res, 429, { error: rateCheck.error });
+                }
+
+                try {
+                    const agentId = process.env.VITE_ELEVENLABS_AGENT_ID || 'agent_1001kjd3c2k0ec59q6t0g57rxrem';
+                    const response = await fetch(
+                        `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${agentId}`,
+                        {
+                            method: 'GET',
+                            headers: {
+                                'xi-api-key': keys.ELEVENLABS_API_KEY,
+                            },
+                        }
+                    );
+
+                    if (!response.ok) {
+                        const errText = await response.text();
+                        console.error('❌ ElevenLabs signed URL error:', response.status, errText);
+                        return sendJson(res, response.status, {
+                            error: `ElevenLabs API error: ${response.status}`,
+                            fallback: true,
+                        });
+                    }
+
+                    const data = await response.json();
+                    sendJson(res, 200, { signedUrl: data.signed_url });
+                } catch (err: any) {
+                    console.error('❌ ElevenLabs signed URL fetch failed:', err.message);
+                    sendJson(res, 500, { error: 'Failed to get signed URL', fallback: true });
+                }
+            });
+
+            // ==================== GAP ANALYSIS API ====================
+            // Get existing analysis
+            server.middlewares.use('/api/analysis/:userId', async (req: any, res: any, next: any) => {
+                const match = req.url.match(/^\/api\/analysis\/([^?]+)/);
+                if (!match || req.method !== 'GET') return next();
+                
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+                
+                const userId = match[1];
+                if (session.userId !== userId && !session.isAdmin) {
+                    return sendJson(res, 403, { error: 'Access denied' });
+                }
+                
+                try {
+                    const analysis = await DB.get(
+                        'SELECT * FROM gap_analysis WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+                        [userId]
+                    );
+                    
+                    if (!analysis) {
+                        return sendJson(res, 404, { error: 'No analysis found' });
+                    }
+                    
+                    sendJson(res, 200, {
+                        analysis: {
+                            id: analysis.id,
+                            target_role: analysis.target_role,
+                            future_ready_score: JSON.parse(analysis.future_ready_score || '{}'),
+                            skill_gaps: JSON.parse(analysis.skill_gaps || '[]'),
+                            profile_conflicts: JSON.parse(analysis.profile_conflicts || '[]'),
+                            job_ready_date: analysis.job_ready_date,
+                            job_ready_months: analysis.job_ready_months
+                        }
+                    });
+                } catch (err: any) {
+                    console.error('Error loading analysis:', err);
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // Run gap analysis
+            server.middlewares.use('/api/analysis/run', async (req: any, res: any,next: any) => {
+                if (req.method !== 'POST') return next();
+                
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+                
+                const rateCheck = checkAndRecordRate(`gap_analysis_${session.userId}`, 2, 10);
+                if (!rateCheck.ok) return sendJson(res, 429, { error: rateCheck.error });
+                
+                try {
+                    const { targetRole } = await parseBody(req);
+                    if (!targetRole) return sendJson(res, 400, { error: 'Target role required' });
+                    
+                    const groqKey = process.env.GROQ_GAP_ANALYSIS_KEY || process.env.GROQ_API_KEY;
+                    if (!groqKey) return sendJson(res, 500, { error: 'Groq API not configured' });
+                    
+                    // Fetch user profile data
+                    const profile = await DB.get('SELECT * FROM user_profiles WHERE user_id = ?', [session.userId]);
+                    const userSkills = profile?.saved_resume_skills ? JSON.parse(profile.saved_resume_skills) : [];
+                    const resumeText = profile?.saved_resume_text || '';
+                    
+                    // Fetch practice performance data
+                    const practiceData = await DB.all(
+                        `SELECT * FROM practice_aptitude WHERE user_id = ? ORDER BY created_at DESC LIMIT 10`,
+                        [session.userId]
+                    );
+
+                    // Fetch REAL GitHub data
+                    const userRow = await DB.get('SELECT github_url FROM users WHERE id = ?', [session.userId]) as any;
+                    const githubUrl: string = userRow?.github_url || '';
+                    let ghData: GitHubProfileData | null = null;
+                    let ghAnalysis: { github_match: number; github_skills: string[]; insight: string } | null = null;
+                    if (githubUrl) {
+                        console.log(`Fetching real GitHub data for gap analysis: ${githubUrl}`);
+                        ghData = await fetchGitHubData(githubUrl);
+                        if (ghData) {
+                            const groqKey2 = process.env.GROQ_API_KEY_2 || '';
+                            const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '';
+                            ghAnalysis = await analyzeGitHubForRole(ghData, targetRole, groqKey2, geminiKey);
+                            console.log(`GitHub analysis done: ${ghData.username} → match=${ghAnalysis.github_match}`);
+                        }
+                    }
+                    
+                    // Build analysis prompt
+                    const prompt = `Analyze the skill gap for a user targeting the role: "${targetRole}"
+
+User Profile:
+- Current Skills: ${userSkills.join(', ') || 'No skills listed'}
+- Resume Summary: ${resumeText.substring(0, 500) || 'No resume available'}
+- Practice Sessions: ${practiceData.length} completed
+- Average Practice Score: ${practiceData.length > 0 ? (practiceData.reduce((sum: number, p: any) => sum + (p.score || 0), 0) / practiceData.length).toFixed(1) : 'N/A'}
+
+GitHub Activity (REAL data fetched live from GitHub API):
+${ghData ? `- Username: ${ghData.username}
+- Public Repos (own, non-fork): ${ghData.publicRepos}
+- Repos pushed in last 6 months: ${ghData.recentlyActivePushed}
+- All-time top languages: ${ghData.topLanguages.join(', ') || 'None'}
+- Recent active languages: ${ghData.recentLanguages.join(', ') || 'None'}
+- Total stars earned: ${ghData.totalStars}
+- Account age: ${ghData.accountAgeYears} years
+- PRE-COMPUTED github_match score: ${ghAnalysis?.github_match ?? 15}
+- GitHub insight: ${ghAnalysis?.insight ?? ''}
+IMPORTANT: Use exactly ${ghAnalysis?.github_match ?? 15} for github_match. This is real data — do NOT change it.` : '- No GitHub profile connected. Use github_match: 15 (minimum).'}
+
+Task: Generate a JSON response with the following structure:
+{
+  "skill_gaps": [
+    {
+      "skill": "Skill Name",
+      "user_score": 0-100,
+      "market_score": 0-100,
+      "gap": difference,
+      "priority": "CRITICAL"|"IMPORTANT"|"MODERATE"|"LOW",
+      "trend": "rising"|"stable"|"declining",
+      "growth_rate": percentage,
+      "estimated_hours": number,
+      "category": "Frontend"|"Backend"|"DevOps"|"Cloud"|"Language"|"Tool"
+    }
+  ],
+  "future_ready_score": {
+    "overall": 0-100,
+    "grade": "A"|"B"|"C"|"D"|"F",
+    "resume_match": 0-100,
+    "github_match": 0-100,
+    "assessment_performance": 0-100,
+    "market_alignment": 0-100
+  },
+  "profile_conflicts": [
+    {
+      "type": "CLAIMED_UNPROVEN"|"PROVEN_UNCLAIMED"|"ASSESSMENT_CONTRADICTION",
+      "skill": "Skill Name",
+      "description": "What the conflict is",
+      "action": "What the user should do to fix this",
+      "severity": "high"|"medium"|"low"
+    }
+  ],
+  "job_ready_months": number
+}
+
+Rules:
+- Provide 8-12 relevant skills for the target role.
+- profile_conflicts: only add real conflicts if resume skills don't match practice scores (max 3). If no real conflicts, return empty array [].
+- IMPORTANT: For future_ready_score, NEVER use 0 for any field. Minimum values: resume_match>=20, github_match>=15, assessment_performance>=25, market_alignment>=20. Base scores on available data - if user has skills listed, resume_match should be at least 30-50. If practice sessions completed, assessment_performance should reflect that (minimum 30 for any completed sessions).
+- overall score = weighted average: resume_match*0.3 + assessment_performance*0.3 + market_alignment*0.25 + github_match*0.15
+- Be realistic about scores.
+- RESPOND WITH ONLY VALID JSON, NO MARKDOWN OR EXPLANATIONS.`;
+
+                    // Call Groq API with retry for network errors (ECONNRESET)
+                    let groqResponse: any = null;
+                    for (let attempt = 0; attempt < 3; attempt++) {
+                        try {
+                            groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${groqKey}`,
+                                },
+                                body: JSON.stringify({
+                                    model: 'llama-3.3-70b-versatile',
+                                    messages: [
+                                        { role: 'system', content: 'You are a technical career analyst. Return ONLY valid compact JSON. No markdown. Keep response under 1500 tokens.' },
+                                        { role: 'user', content: prompt }
+                                    ],
+                                    temperature: 0.3,
+                                    max_tokens: 2048,
+                                }),
+                            });
+                            break;
+                        } catch (fetchErr: any) {
+                            console.warn(`Groq analysis attempt ${attempt + 1} failed:`, fetchErr.message);
+                            if (attempt === 2) throw fetchErr;
+                            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+                        }
+                    }
+
+                    if (!groqResponse || !groqResponse.ok) {
+                        const errText = groqResponse ? await groqResponse.text() : 'No response';
+                        console.error('Groq API error:', groqResponse?.status, errText);
+                        return sendJson(res, 500, { error: 'Analysis generation failed' });
+                    }
+
+                    const groqData = await groqResponse.json();
+                    let content = groqData.choices?.[0]?.message?.content?.trim() || '';
+                    
+                    // Clean up response
+                    content = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                    
+                    let analysisData;
+                    try {
+                        analysisData = JSON.parse(content);
+                    } catch (parseErr) {
+                        console.error('Failed to parse Groq response:', content);
+                        return sendJson(res, 500, { error: 'Invalid analysis data' });
+                    }
+                    
+                    const analysisId = generateId();
+                    const skillGaps = analysisData.skill_gaps || [];
+                    const rawScore = analysisData.future_ready_score || {};
+                    
+                    // Enforce minimum scores - never show 0% (misleading for new users)
+                    const hasSkills = userSkills.length > 0;
+                    const hasPractice = practiceData.length > 0;
+                    const avgScore = hasPractice ? practiceData.reduce((s: number, p: any) => s + (p.score || 0), 0) / practiceData.length : 0;
+                    const resumeMin = hasSkills ? 30 : 20;
+                    const practiceMin = hasPractice ? Math.max(25, Math.round(avgScore * 0.5)) : 20;
+                    
+                    const futureReadyScore = {
+                        resume_match: Math.max(resumeMin, rawScore.resume_match || 0),
+                        // If real GitHub data was fetched, always use that score (authoritative)
+                        github_match: ghAnalysis
+                            ? ghAnalysis.github_match
+                            : Math.max(15, rawScore.github_match || 0),
+                        assessment_performance: Math.max(practiceMin, rawScore.assessment_performance || 0),
+                        market_alignment: Math.max(20, rawScore.market_alignment || 0),
+                        overall: 0,
+                        grade: 'F'
+                    };
+                    // Recalculate overall from components
+                    futureReadyScore.overall = Math.round(
+                        futureReadyScore.resume_match * 0.30 +
+                        futureReadyScore.assessment_performance * 0.30 +
+                        futureReadyScore.market_alignment * 0.25 +
+                        futureReadyScore.github_match * 0.15
+                    );
+                    futureReadyScore.grade = futureReadyScore.overall >= 80 ? 'A' : futureReadyScore.overall >= 65 ? 'B' : futureReadyScore.overall >= 50 ? 'C' : futureReadyScore.overall >= 35 ? 'D' : 'F';
+                    
+                    const profileConflicts = analysisData.profile_conflicts || [];
+                    const job_ready_months = Math.min(12, Math.max(3, analysisData.job_ready_months || 12));
+                    const job_ready_date = new Date(Date.now() + job_ready_months * 30 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+                    
+                    // Store in database
+                    await DB.run(
+                        `INSERT INTO gap_analysis (id, user_id, target_role, future_ready_score, skill_gaps, profile_conflicts, job_ready_date, job_ready_months, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+                        [analysisId, session.userId, targetRole, JSON.stringify(futureReadyScore), JSON.stringify(skillGaps), JSON.stringify(profileConflicts), job_ready_date, job_ready_months]
+                    );
+                    
+                    sendJson(res, 200, {
+                        analysis: {
+                            id: analysisId,
+                            target_role: targetRole,
+                            future_ready_score: futureReadyScore,
+                            skill_gaps: skillGaps,
+                            profile_conflicts: profileConflicts,
+                            job_ready_date,
+                            job_ready_months
+                        }
+                    });
+                } catch (err: any) {
+                    console.error('Error running analysis:', err);
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // Get roadmap
+            server.middlewares.use('/api/roadmap/:userId', async (req: any, res: any, next: any) => {
+                const match = req.url.match(/^\/api\/roadmap\/([^?]+)/);
+                if (!match || req.method !== 'GET') return next();
+                
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+                
+                const userId = match[1];
+                if (session.userId !== userId && !session.isAdmin) {
+                    return sendJson(res, 403, { error: 'Access denied' });
+                }
+                
+                try {
+                    const roadmap = await DB.get(
+                        'SELECT * FROM learning_roadmaps WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+                        [userId]
+                    );
+                    
+                    if (!roadmap) {
+                        return sendJson(res, 404, { error: 'No roadmap found' });
+                    }
+                    
+                    sendJson(res, 200, {
+                        roadmap: {
+                            id: roadmap.id,
+                            mermaid_code: roadmap.mermaid_code,
+                            monthly_plan: JSON.parse(roadmap.monthly_plan || '[]'),
+                            total_months: roadmap.total_months,
+                            total_hours: roadmap.total_hours,
+                            job_ready_date: roadmap.job_ready_date
+                        }
+                    });
+                } catch (err: any) {
+                    console.error('Error loading roadmap:', err);
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // Generate roadmap
+            server.middlewares.use('/api/roadmap/generate', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+                
+                const rateCheck = checkAndRecordRate(`roadmap_${session.userId}`, 2, 10);
+                if (!rateCheck.ok) return sendJson(res, 429, { error: rateCheck.error });
+                
+                try {
+                    const { targetRole, gapAnalysisId } = await parseBody(req);
+                    if (!targetRole) return sendJson(res, 400, { error: 'Target role required' });
+                    
+                    const groqKey = process.env.GROQ_GAP_ANALYSIS_KEY || process.env.GROQ_API_KEY;
+                    if (!groqKey) return sendJson(res, 500, { error: 'Groq API not configured' });
+                    
+                    // Fetch the gap analysis data (simple queries - Supabase adapter can't handle OR)
+                    let analysis = null;
+                    if (gapAnalysisId) {
+                        analysis = await DB.get(
+                            'SELECT * FROM gap_analysis WHERE id = ?',
+                            [gapAnalysisId]
+                        );
+                    }
+                    if (!analysis) {
+                        analysis = await DB.get(
+                            'SELECT * FROM gap_analysis WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+                            [session.userId]
+                        );
+                    }
+                    
+                    if (!analysis) {
+                        return sendJson(res, 404, { error: 'Gap analysis not found. Run an analysis first.' });
+                    }
+                    
+                    const skillGaps = JSON.parse(analysis.skill_gaps || '[]');
+                    const futureReadyScore = JSON.parse(analysis.future_ready_score || '{}');
+                    
+                    // Use all skills, allow up to 12 months
+                    const topSkills = skillGaps.slice(0, 12);
+                    const monthsCap = Math.min(analysis.job_ready_months || 12, 12);
+                    
+                    // Distribute skills across months
+                    const skillList = topSkills.map((sg: any) => `- ${sg.skill}: gap ${sg.gap}, ${sg.priority}, ~${sg.estimated_hours}h`).join('\n');
+                    
+                    // Build detailed roadmap prompt
+                    const prompt = `Create a ${monthsCap}-month learning roadmap for "${targetRole}".
+
+Skill gaps to address:
+${skillList}
+
+Return ONLY valid JSON with this structure:
+{
+  "monthly_plan": [
+    {
+      "month": 1,
+      "title": "Foundation - Python & SQL Basics",
+      "skills": [
+        {
+          "skill": "Python",
+          "priority": "CRITICAL",
+          "hours": 30,
+          "courses": [
+            {"name": "Python for Beginners", "platform": "YouTube", "duration": "10h", "free": true, "url": "https://youtube.com/watch?v=example"},
+            {"name": "Python Bootcamp", "platform": "Udemy", "duration": "20h", "free": false, "url": "https://udemy.com/course/python-bootcamp"}
+          ]
+        }
+      ],
+      "total_hours": 30,
+      "projected_score_improvement": 8
+    }
+  ],
+  "total_months": ${monthsCap},
+  "total_hours": 300
+}
+
+STRICT RULES:
+- EXACTLY ${monthsCap} months in monthly_plan array
+- Each month title MUST describe what skills to learn (e.g. "Month 3 - React & Testing")
+- 1-2 skills per month, spread all ${topSkills.length} skills across all ${monthsCap} months
+- 2-3 courses per skill with REAL URLs from YouTube, Udemy, Coursera, freeCodeCamp, etc.
+- Course names must be descriptive (e.g. "Complete React Course 2024")
+- Include both free and paid courses
+- DO NOT include mermaid_code field, I will generate it myself
+- Keep total JSON compact, focus on course quality`;
+
+                    // Call Groq API with retry
+                    let groqRoadmapRes: any = null;
+                    for (let attempt = 0; attempt < 3; attempt++) {
+                        try {
+                            groqRoadmapRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${groqKey}`,
+                                },
+                                body: JSON.stringify({
+                                    model: 'llama-3.3-70b-versatile',
+                                    messages: [
+                                        { role: 'system', content: 'Return ONLY valid compact JSON. No markdown. No mermaid_code field. Focus on providing real course URLs and descriptive month titles.' },
+                                        { role: 'user', content: prompt }
+                                    ],
+                                    temperature: 0.3,
+                                    max_tokens: 6000,
+                                }),
+                            });
+                            break;
+                        } catch (fetchErr: any) {
+                            console.warn(`Groq roadmap attempt ${attempt + 1} failed:`, fetchErr.message);
+                            if (attempt === 2) throw fetchErr;
+                            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+                        }
+                    }
+
+                    if (!groqRoadmapRes || !groqRoadmapRes.ok) {
+                        console.error('Groq roadmap API error:', groqRoadmapRes?.status);
+                        return sendJson(res, 500, { error: 'Roadmap generation failed' });
+                    }
+
+                    const groqData = await groqRoadmapRes.json();
+                    let content = groqData.choices?.[0]?.message?.content?.trim() || '';
+                    content = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                    
+                    // Check if truncated
+                    const wasTruncated = groqData.choices?.[0]?.finish_reason === 'length';
+                    
+                    let roadmapData;
+                    try {
+                        roadmapData = JSON.parse(content);
+                    } catch (parseErr) {
+                        if (wasTruncated) {
+                            console.warn('Groq roadmap response truncated. Content length:', content.length);
+                            // Try to recover: find last complete month object in monthly_plan array
+                            try {
+                                const planStart = content.indexOf('"monthly_plan"');
+                                const arrStart = content.indexOf('[', planStart);
+                                if (arrStart > 0) {
+                                    let depth = 0, lastComplete = -1, inStr = false, esc = false;
+                                    for (let i = arrStart; i < content.length; i++) {
+                                        const c = content[i];
+                                        if (esc) { esc = false; continue; }
+                                        if (c === '\\') { esc = true; continue; }
+                                        if (c === '"') { inStr = !inStr; continue; }
+                                        if (inStr) continue;
+                                        if (c === '{') depth++;
+                                        if (c === '}') { depth--; if (depth === 0) lastComplete = i; }
+                                    }
+                                    if (lastComplete > 0) {
+                                        const fixed = content.substring(0, lastComplete + 1) + 
+                                            `],"total_months":${monthsCap},"total_hours":200}`;
+                                        roadmapData = JSON.parse(fixed);
+                                        console.log('✅ Recovered truncated roadmap JSON with', roadmapData.monthly_plan?.length, 'months');
+                                    }
+                                }
+                            } catch { /* fall through to fallback */ }
+                        }
+                        
+                        // Final fallback: generate a detailed roadmap from skill data
+                        if (!roadmapData) {
+                            console.warn('Using fallback roadmap generation');
+                            const fallbackPlan: any[] = [];
+                            const skillsPerMonth = Math.max(1, Math.ceil(topSkills.length / monthsCap));
+                            for (let m = 0; m < monthsCap; m++) {
+                                const monthSkills = topSkills.slice(m * skillsPerMonth, (m + 1) * skillsPerMonth);
+                                if (monthSkills.length === 0) {
+                                    // Fill remaining months with review/practice
+                                    fallbackPlan.push({
+                                        month: m + 1,
+                                        title: `Review & Practice`,
+                                        skills: [{ 
+                                            skill: 'Portfolio Projects', 
+                                            priority: 'IMPORTANT', 
+                                            hours: 25, 
+                                            courses: [
+                                                { name: 'Build Real Projects', platform: 'YouTube', duration: '15h', free: true, url: 'https://youtube.com' },
+                                                { name: 'Portfolio Development', platform: 'freeCodeCamp', duration: '10h', free: true, url: 'https://freecodecamp.org' }
+                                            ] 
+                                        }],
+                                        total_hours: 25,
+                                        projected_score_improvement: 5
+                                    });
+                                } else {
+                                    const skillNames = monthSkills.map((s: any) => s.skill).join(' & ');
+                                    fallbackPlan.push({
+                                        month: m + 1,
+                                        title: skillNames,
+                                        skills: monthSkills.map((sg: any) => ({
+                                            skill: sg.skill,
+                                            priority: sg.priority || 'IMPORTANT',
+                                            hours: sg.estimated_hours || 25,
+                                            courses: [
+                                                { name: `${sg.skill} Complete Guide`, platform: 'YouTube', duration: `${Math.round((sg.estimated_hours || 25) * 0.4)}h`, free: true, url: 'https://youtube.com' },
+                                                { name: `${sg.skill} Masterclass`, platform: 'Udemy', duration: `${Math.round((sg.estimated_hours || 25) * 0.6)}h`, free: false, url: 'https://udemy.com' }
+                                            ]
+                                        })),
+                                        total_hours: monthSkills.reduce((s: number, sg: any) => s + (sg.estimated_hours || 25), 0),
+                                        projected_score_improvement: Math.round(monthSkills.reduce((s: number, sg: any) => s + (sg.gap || 10), 0) / monthsCap)
+                                    });
+                                }
+                            }
+                            roadmapData = {
+                                monthly_plan: fallbackPlan,
+                                total_months: monthsCap,
+                                total_hours: fallbackPlan.reduce((s: number, m: any) => s + m.total_hours, 0)
+                            };
+                        }
+                    }
+                    
+                    const roadmapId = generateId();
+                    const monthlyPlan = roadmapData.monthly_plan || [];
+                    
+                    // ALWAYS generate Mermaid code server-side from monthly_plan data
+                    // This ensures descriptive nodes with skill names in each month
+                    const mermaidLines: string[] = ['graph TD'];
+                    mermaidLines.push('    Start([🚀 Start Learning])');
+                    
+                    monthlyPlan.forEach((m: any, idx: number) => {
+                        const skillNames = (m.skills || []).map((s: any) => s.skill).join(', ');
+                        // Sanitize: remove special chars that break mermaid
+                        const safeTitle = (m.title || skillNames || 'Study').replace(/[":;()[\]{}|<>#&]/g, '').substring(0, 40);
+                        const safeSkills = skillNames.replace(/[":;()[\]{}|<>#&]/g, '').substring(0, 50);
+                        mermaidLines.push(`    M${m.month}["Month ${m.month}\\n${safeTitle}\\n${m.total_hours || 20}h"]`);
+                    });
+                    
+                    mermaidLines.push('    Done([✅ Job Ready!])');
+                    
+                    // Connect nodes
+                    if (monthlyPlan.length > 0) {
+                        mermaidLines.push(`    Start --> M${monthlyPlan[0].month}`);
+                        for (let i = 0; i < monthlyPlan.length - 1; i++) {
+                            mermaidLines.push(`    M${monthlyPlan[i].month} --> M${monthlyPlan[i + 1].month}`);
+                        }
+                        mermaidLines.push(`    M${monthlyPlan[monthlyPlan.length - 1].month} --> Done`);
+                    } else {
+                        mermaidLines.push('    Start --> Done');
+                    }
+                    
+                    // Add styling
+                    mermaidLines.push('    style Start fill:#10b981,stroke:#059669,color:#fff');
+                    mermaidLines.push('    style Done fill:#8b5cf6,stroke:#7c3aed,color:#fff');
+                    monthlyPlan.forEach((m: any) => {
+                        const hasCritical = (m.skills || []).some((s: any) => s.priority === 'CRITICAL');
+                        if (hasCritical) {
+                            mermaidLines.push(`    style M${m.month} fill:#ef4444,stroke:#dc2626,color:#fff`);
+                        } else {
+                            mermaidLines.push(`    style M${m.month} fill:#3b82f6,stroke:#2563eb,color:#fff`);
+                        }
+                    });
+                    
+                    let mermaidCode = mermaidLines.join('\n');
+                    
+                    const total_months = roadmapData.total_months || analysis.job_ready_months || 12;
+                    const total_hours = roadmapData.total_hours || skillGaps.reduce((sum: number, sg: any) => sum + (sg.estimated_hours || 0), 0);
+                    const job_ready_date = analysis.job_ready_date;
+                    
+                    await DB.run(
+                        `INSERT INTO learning_roadmaps (id, user_id, gap_analysis_id, mermaid_code, monthly_plan, total_months, total_hours, job_ready_date, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+                        [roadmapId, session.userId, analysis.id, mermaidCode, JSON.stringify(monthlyPlan), total_months, total_hours, job_ready_date]
+                    );
+                    
+                    sendJson(res, 200, {
+                        roadmap: {
+                            id: roadmapId,
+                            mermaid_code: mermaidCode,
+                            monthly_plan: monthlyPlan,
+                            total_months,
+                            total_hours,
+                            job_ready_date
+                        }
+                    });
+                } catch (err: any) {
+                    console.error('Error generating roadmap:', err);
+                    sendJson(res, 500, { error: err.message });
+                }
+            });
+
+            // AI Narrative
+            server.middlewares.use('/api/analysis/narrative', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                
+                try {
+                    const { targetRole, futureReadyScore, skillGaps } = await parseBody(req);
+                    
+                    const groqKey = process.env.GROQ_GAP_ANALYSIS_KEY || process.env.GROQ_API_KEY;
+                    if (!groqKey) {
+                        // Fallback to simple narrative if no API key
+                        const narrative = {
+                            executive_summary: `Based on your profile analysis for ${targetRole}, you're currently at a ${futureReadyScore?.grade || 'C'} readiness level.`,
+                            critical_insights: skillGaps?.slice(0, 3).map((sg: any) => ({
+                                skill: sg.skill,
+                                insight: `${sg.priority} priority skill with ${sg.gap} point gap to market standards.`
+                            })) || [],
+                            strength_callout: 'Focus on your critical skill gaps to accelerate your career progress.',
+                            motivational_closing: 'Stay consistent with your learning plan!'
+                        };
+                        return sendJson(res, 200, { narrative });
+                    }
+                    
+                    const prompt = `Generate a personalized career narrative for a candidate targeting: ${targetRole}
+
+Profile Analysis:
+- Overall Readiness: ${futureReadyScore?.overall || 50}/100 (Grade ${futureReadyScore?.grade || 'C'})
+- Resume Match: ${futureReadyScore?.resume_match || 50}%
+- Assessment Performance: ${futureReadyScore?.assessment_performance || 50}%
+- Market Alignment: ${futureReadyScore?.market_alignment || 50}%
+
+Top Skill Gaps:
+${skillGaps?.slice(0, 5).map((sg: any) => `- ${sg.skill}: ${sg.gap} point gap (${sg.priority})`).join('\n') || 'No gaps identified'}
+
+Generate a JSON response with:
+{
+  "executive_summary": "2-3 sentence overview of current readiness and path to job-ready status",
+  "critical_insights": [
+    {"skill": "Skill name", "insight": "Why this matters and what to do"}
+  ],
+  "strength_callout": "Highlight a positive aspect from their profile",
+  "motivational_closing": "Encouraging message to keep them motivated"
+}
+
+Be encouraging, specific, and actionable. RESPOND WITH ONLY VALID JSON.`;
+
+                    const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${groqKey}`,
+                        },
+                        body: JSON.stringify({
+                            model: 'llama-3.3-70b-versatile',
+                            messages: [
+                                { role: 'system', content: 'You are a supportive career coach. Generate motivational and specific career guidance in JSON format.' },
+                                { role: 'user', content: prompt }
+                            ],
+                            temperature: 0.6,
+                            max_tokens: 1024,
+                        }),
+                    });
+
+                    if (!groqResponse.ok) {
+                        throw new Error('Groq API failed');
+                    }
+
+                    const groqData = await groqResponse.json();
+                    let content = groqData.choices?.[0]?.message?.content?.trim() || '';
+                    content = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                    
+                    const narrative = JSON.parse(content);
+                    sendJson(res, 200, { narrative });
+                } catch (err: any) {
+                    console.error('Error generating narrative:', err);
+                    // Fallback narrative
+                    const narrative = {
+                        executive_summary: 'Your profile shows promise. Focus on addressing your skill gaps systematically.',
+                        critical_insights: [],
+                        strength_callout: 'Keep building on your existing strengths.',
+                        motivational_closing: 'Stay committed to your learning journey!'
+                    };
+                    sendJson(res, 200, { narrative });
+                }
+            });
+
+            // Skill explanation
+            server.middlewares.use('/api/analysis/skill-explain', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                
+                try {
+                    const { skill, userScore, marketScore, targetRole } = await parseBody(req);
+                    
+                    const groqKey = process.env.GROQ_GAP_ANALYSIS_KEY || process.env.GROQ_API_KEY;
+                    if (!groqKey) {
+                        // Fallback explanation
+                        const explanation = {
+                            why_matters: `${skill} is important for ${targetRole} roles and is in demand in the current job market.`,
+                            how_to_prove: `Build projects, contribute to open source, and complete relevant certifications.`,
+                            project_idea: `Create a portfolio project that demonstrates ${skill} proficiency.`
+                        };
+                        return sendJson(res, 200, { explanation });
+                    }
+                    
+                    const prompt = `Explain the skill "${skill}" for someone targeting: ${targetRole}
+
+Context:
+- User's Current Level: ${userScore}/100
+- Market Expectation: ${marketScore}/100
+- Gap: ${marketScore - userScore} points
+
+Generate a JSON response with:
+{
+  "why_matters": "Why this skill is critical for the target role (2-3 sentences)",
+  "how_to_prove": "Concrete ways to demonstrate proficiency (certifications, projects, contributions)",
+  "project_idea": "A specific project idea they can build to showcase this skill"
+}
+
+Be specific, actionable, and relevant to ${targetRole}. RESPOND WITH ONLY VALID JSON.`;
+
+                    const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${groqKey}`,
+                        },
+                        body: JSON.stringify({
+                            model: 'llama-3.3-70b-versatile',
+                            messages: [
+                                { role: 'system', content: 'You are a technical mentor providing specific, actionable skill development advice in JSON format.' },
+                                { role: 'user', content: prompt }
+                            ],
+                            temperature: 0.5,
+                            max_tokens: 800,
+                        }),
+                    });
+
+                    if (!groqResponse.ok) {
+                        throw new Error('Groq API failed');
+                    }
+
+                    const groqData = await groqResponse.json();
+                    let content = groqData.choices?.[0]?.message?.content?.trim() || '';
+                    content = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                    
+                    const explanation = JSON.parse(content);
+                    sendJson(res, 200, { explanation });
+                } catch (err: any) {
+                    console.error('Error generating skill explanation:', err);
+                    // Fallback
+                    const explanation = {
+                        why_matters: `${skill} is a valuable skill for ${targetRole} positions.`,
+                        how_to_prove: 'Build projects and gain hands-on experience.',
+                        project_idea: 'Create a portfolio-worthy project demonstrating your skills.'
+                    };
+                    sendJson(res, 200, { explanation });
+                }
+            });
+
+            // ==================== COMPANY INTERVIEW SIMULATOR ====================
+
+            // POST /api/company-interview/questions
+            // Generates 5 company-specific questions for a given round
+            server.middlewares.use('/api/company-interview/questions', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const body = await parseBody(req);
+                    const { company, round } = body;
+                    if (!company || !round) return sendJson(res, 400, { error: 'company and round are required' });
+
+                    const groqKey = process.env.GROQ_GAP_ANALYSIS_KEY || process.env.GROQ_API_KEY;
+                    if (!groqKey) return sendJson(res, 500, { error: 'GROQ key not configured' });
+
+                    const roundDescriptions: Record<string, string> = {
+                        DSA: 'Data Structures and Algorithms (arrays, trees, graphs, dynamic programming, sorting)',
+                        SYSTEM_DESIGN: 'System Design and Architecture (scalability, databases, APIs, microservices, caching)',
+                        HR: 'HR and Behavioral (situational, leadership, teamwork, conflict resolution, career goals)',
+                        TECHNICAL: 'Technical CS fundamentals (OOP, OS, DBMS, networking, project-based)',
+                    };
+                    const roundDesc = roundDescriptions[round] || round;
+
+                    const prompt = `Generate exactly 5 interview questions that ${company} commonly asks in their ${roundDesc} interview round.
+Return ONLY valid JSON in this exact format (no markdown, no extra text):
+{
+  "questions": [
+    {
+      "id": 1,
+      "question": "<full question text>",
+      "topic": "<specific topic, e.g. Binary Search / LRU Cache / Leadership>",
+      "difficulty": "Easy" | "Medium" | "Hard",
+      "hint": "<one-line hint to guide the candidate>"
+    }
+  ]
+}
+Rules:
+- Questions must reflect ${company}'s actual interview style and difficulty
+- Vary difficulty: include 1 Easy, 2-3 Medium, 1-2 Hard
+- Topics should be specific to the ${roundDesc} round
+- Each question must be unique and realistic
+- Hints should be subtle guidance, not give away the answer`;
+
+                    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey}` },
+                        body: JSON.stringify({
+                            model: 'llama-3.3-70b-versatile',
+                            messages: [
+                                { role: 'system', content: 'You are an expert technical interview coach with deep knowledge of company-specific hiring processes. Return only valid JSON.' },
+                                { role: 'user', content: prompt }
+                            ],
+                            temperature: 0.7,
+                            max_tokens: 1500,
+                        }),
+                    });
+
+                    if (!groqRes.ok) return sendJson(res, 500, { error: 'Groq API error' });
+                    const groqData = await groqRes.json();
+                    let content = groqData.choices?.[0]?.message?.content?.trim() || '';
+                    content = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                    const parsed = JSON.parse(content);
+                    sendJson(res, 200, { questions: parsed.questions });
+                } catch (err: any) {
+                    console.error('Company interview questions error:', err);
+                    sendJson(res, 500, { error: 'Failed to generate questions' });
+                }
+            });
+
+            // POST /api/company-interview/evaluate
+            // Evaluates a single answer and returns AI feedback
+            server.middlewares.use('/api/company-interview/evaluate', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                try {
+                    const body = await parseBody(req);
+                    const { company, round, question, topic, answer } = body;
+                    if (!company || !question || !answer) return sendJson(res, 400, { error: 'company, question and answer are required' });
+
+                    const groqKey = process.env.GROQ_GAP_ANALYSIS_KEY || process.env.GROQ_API_KEY;
+                    if (!groqKey) return sendJson(res, 500, { error: 'GROQ key not configured' });
+
+                    const prompt = `You are a senior ${company} interviewer evaluating a candidate's answer.
+Question: ${question}
+Topic: ${topic || 'General'}
+Candidate's Answer: ${answer}
+
+Evaluate the answer and return ONLY valid JSON:
+{
+  "score": <integer 1-10>,
+  "what_was_good": "<specific praise about what the candidate did well, 1-2 sentences>",
+  "what_was_missing": "<specific gaps or improvements needed, 1-2 sentences>",
+  "model_answer": "<ideal concise answer a top candidate would give, 3-5 sentences>",
+  "key_points": ["<point 1>", "<point 2>", "<point 3>"]
+}
+Scoring guide: 1-3 = very poor, 4-5 = partial, 6-7 = good, 8-9 = strong, 10 = exceptional.
+Be honest and constructive. Score based on technical accuracy, depth, and clarity.`;
+
+                    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey}` },
+                        body: JSON.stringify({
+                            model: 'llama-3.3-70b-versatile',
+                            messages: [
+                                { role: 'system', content: 'You are a strict but fair technical interviewer. Return only valid JSON.' },
+                                { role: 'user', content: prompt }
+                            ],
+                            temperature: 0.4,
+                            max_tokens: 700,
+                        }),
+                    });
+
+                    if (!groqRes.ok) throw new Error('Groq API error');
+                    const groqData = await groqRes.json();
+                    let content = groqData.choices?.[0]?.message?.content?.trim() || '';
+                    content = content.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+                    const feedback = JSON.parse(content);
+                    sendJson(res, 200, { feedback });
+                } catch (err: any) {
+                    console.error('Company interview evaluate error:', err);
+                    // Graceful fallback
+                    sendJson(res, 200, {
+                        feedback: {
+                            score: 5,
+                            what_was_good: 'You attempted the question with some relevant points.',
+                            what_was_missing: 'Could not evaluate fully — try providing more detail.',
+                            model_answer: 'Review this topic and revisit the question with more depth.',
+                            key_points: ['Be specific and structured', 'Use examples', 'Cover edge cases'],
+                        }
+                    });
+                }
+            });
+
+            // POST /api/company-interview/save — persist completed session
+            server.middlewares.use('/api/company-interview/save', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+                try {
+                    const body = await parseBody(req);
+                    const { company, round, score, questions_count, results } = body;
+                    if (!company || !round) return sendJson(res, 400, { error: 'company and round required' });
+
+                    const id = generateId();
+                    await DB.run(
+                        `INSERT INTO company_interviews (id, user_id, company, round, score, questions_count, results, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [id, session.userId, company, round, score || 0, questions_count || 5, JSON.stringify(results || []), new Date().toISOString()]
+                    );
+
+                    // Log to user_activities so it appears on Profile page
+                    await DB.run(
+                        `INSERT INTO user_activities (id, user_id, activity_type, activity_title, activity_description, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                        [
+                            generateId(), session.userId,
+                            'company_interview',
+                            `${company} — ${round.replace(/_/g, ' ')} Interview`,
+                            `Completed mock interview · Score: ${score}/100 · ${questions_count || 5} questions`,
+                            JSON.stringify({ company, round, score, questions_count }),
+                            new Date().toISOString(),
+                        ]
+                    );
+
+                    sendJson(res, 201, { id });
+                } catch (err: any) {
+                    console.error('Company interview save error:', err);
+                    sendJson(res, 500, { error: 'Failed to save session' });
+                }
+            });
+
+            // GET /api/company-interview/history — fetch user's past sessions
+            server.middlewares.use('/api/company-interview/history', async (req: any, res: any, next: any) => {
+                if (req.method !== 'GET') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+                try {
+                    const rows = await DB.all(
+                        'SELECT id, company, round, score, questions_count, created_at FROM company_interviews WHERE user_id = ? ORDER BY created_at DESC LIMIT 20',
+                        [session.userId]
+                    );
+                    sendJson(res, 200, { history: rows });
+                } catch (err: any) {
+                    console.error('Company interview history error:', err);
+                    sendJson(res, 500, { error: 'Failed to fetch history' });
+                }
+            });
+
+            // ==================== CAREER MENTOR ENDPOINTS ====================
+
+            // GET /api/mentor/context — Fetch all user career data for AI context
+            server.middlewares.use('/api/mentor/context', async (req: any, res: any, next: any) => {
+                if (req.method !== 'GET') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+                try {
+                    // 1. Profile: skills + resume summary
+                    const profile = await DB.get(
+                        'SELECT saved_resume_skills, saved_resume_text, target_role FROM user_profiles WHERE user_id = ?',
+                        [session.userId]
+                    ).catch(() => null);
+
+                    let skills: string[] = [];
+                    let resumeSummary = '';
+                    let targetRole = '';
+                    if (profile) {
+                        try { skills = JSON.parse(profile.saved_resume_skills || '[]'); } catch { skills = []; }
+                        resumeSummary = (profile.saved_resume_text || '').substring(0, 300);
+                        targetRole = profile.target_role || '';
+                    }
+
+                    // 2. Latest gap analysis
+                    const gapRow = await DB.get(
+                        'SELECT target_role, future_ready_score, skill_gaps, grade FROM gap_analysis WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+                        [session.userId]
+                    ).catch(() => null);
+
+                    let gapAnalysis: any = null;
+                    if (gapRow) {
+                        let skillGaps: any[] = [];
+                        try { skillGaps = JSON.parse(gapRow.skill_gaps || '[]'); } catch { skillGaps = []; }
+                        const topGaps = skillGaps
+                            .sort((a: any, b: any) => (b.gap || 0) - (a.gap || 0))
+                            .slice(0, 6);
+                        gapAnalysis = {
+                            targetRole: gapRow.target_role,
+                            futureReadyScore: gapRow.future_ready_score,
+                            grade: gapRow.grade,
+                            topGaps,
+                            weakSkills: topGaps.filter((g: any) => g.priority === 'CRITICAL').map((g: any) => g.skill),
+                        };
+                        if (!targetRole) targetRole = gapRow.target_role || '';
+                    }
+
+                    // 3. Practice history — last 10 aptitude sessions
+                    const practiceRows = await DB.all(
+                        'SELECT score, total_questions FROM practice_aptitude WHERE user_id = ? ORDER BY created_at DESC LIMIT 10',
+                        [session.userId]
+                    ).catch(() => []);
+
+                    let practiceAvg = 0;
+                    if (practiceRows.length > 0) {
+                        const pcts = practiceRows.map((r: any) =>
+                            r.total_questions > 0 ? Math.round((r.score / r.total_questions) * 100) : 0
+                        );
+                        practiceAvg = Math.round(pcts.reduce((a: number, b: number) => a + b, 0) / pcts.length);
+                    }
+
+                    // 4. Company interview history — last 5
+                    const companyRows = await DB.all(
+                        'SELECT company, round, score, created_at FROM company_interviews WHERE user_id = ? ORDER BY created_at DESC LIMIT 5',
+                        [session.userId]
+                    ).catch(() => []);
+
+                    sendJson(res, 200, {
+                        skills,
+                        resumeSummary,
+                        targetRole,
+                        gapAnalysis,
+                        practiceAvg,
+                        practiceSessions: practiceRows.length,
+                        companyInterviews: companyRows,
+                        hasData: skills.length > 0 || gapAnalysis !== null || practiceRows.length > 0,
+                    });
+                } catch (err: any) {
+                    console.error('Mentor context error:', err);
+                    sendJson(res, 500, { error: 'Failed to fetch mentor context' });
+                }
+            });
+
+            // POST /api/mentor/chat — AI Career Mentor using Groq (Gemini fallback)
+            server.middlewares.use('/api/mentor/chat', async (req: any, res: any, next: any) => {
+                if (req.method !== 'POST') return next();
+                const session = getSession(req);
+                if (!session) return sendJson(res, 401, { error: 'Not authenticated' });
+                try {
+                    const body = await parseBody(req);
+                    const { message, history = [], context } = body;
+                    if (!message?.trim()) return sendJson(res, 400, { error: 'Message required' });
+
+                    // Build rich system prompt from context
+                    const ctx = context || {};
+                    let systemPrompt = `You are an expert AI Career Mentor inside VidyaMitra, an interview prep platform. You have access to this user's real profile data and must give specific, data-driven, actionable advice.
+
+USER PROFILE:`;
+                    if (ctx.skills?.length > 0) {
+                        systemPrompt += `\n• Known skills: ${ctx.skills.slice(0, 15).join(', ')}`;
+                    }
+                    if (ctx.targetRole) {
+                        systemPrompt += `\n• Target role: ${ctx.targetRole}`;
+                    }
+                    if (ctx.resumeSummary) {
+                        systemPrompt += `\n• Resume snippet: "${ctx.resumeSummary.substring(0, 200)}..."`;
+                    }
+                    if (ctx.gapAnalysis) {
+                        const g = ctx.gapAnalysis;
+                        systemPrompt += `\n• Future-Ready Score: ${g.futureReadyScore}/100 (Grade ${g.grade})`;
+                        if (g.topGaps?.length > 0) {
+                            const gapList = g.topGaps.slice(0, 5).map((gap: any) =>
+                                `${gap.skill} (gap: ${gap.gap || 0}%, ${gap.priority || 'normal'})`
+                            ).join(', ');
+                            systemPrompt += `\n• Skill gaps: ${gapList}`;
+                        }
+                        if (g.weakSkills?.length > 0) {
+                            systemPrompt += `\n• Critical weak skills: ${g.weakSkills.join(', ')}`;
+                        }
+                    }
+                    if (ctx.practiceSessions > 0) {
+                        systemPrompt += `\n• Practice aptitude: avg ${ctx.practiceAvg}% over ${ctx.practiceSessions} session(s)`;
+                    }
+                    if (ctx.companyInterviews?.length > 0) {
+                        const recent = ctx.companyInterviews.slice(0, 3).map((ci: any) =>
+                            `${ci.company} ${ci.round}: ${ci.score}%`
+                        ).join(', ');
+                        systemPrompt += `\n• Recent company interviews: ${recent}`;
+                    }
+
+                    systemPrompt += `
+
+MENTOR GUIDELINES:
+- Reference the user's ACTUAL scores, skills, and gaps — don't be generic
+- If score is low, give specific improvement steps
+- Suggest which VidyaMitra features to use (mock interview, coding practice, aptitude, career planner)
+- For skill gaps, suggest concrete resources and a priority order
+- Keep responses under 200 words unless user asks for a detailed plan
+- Be direct, encouraging, and specific — like a personal career coach
+- Use **bold** for key points and skill names`;
+
+                    // Build message history
+                    const historyText = (history || []).slice(-6).map((m: any) =>
+                        `${m.role === 'user' ? 'User' : 'Mentor'}: ${m.content}`
+                    ).join('\n');
+
+                    const groqApiKey = process.env.GROQ_API_KEY;
+                    const geminiApiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_CHATBOT_API_KEY;
+
+                    // Try Groq first
+                    if (groqApiKey) {
+                        try {
+                            const groqBody = {
+                                model: 'llama-3.1-8b-instant',
+                                messages: [
+                                    { role: 'system', content: systemPrompt },
+                                    ...(historyText ? [{ role: 'user', content: `[Previous conversation]\n${historyText}` }, { role: 'assistant', content: 'Understood. I have the context.' }] : []),
+                                    { role: 'user', content: message },
+                                ],
+                                max_tokens: 400,
+                                temperature: 0.7,
+                            };
+                            const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                                method: 'POST',
+                                headers: { 'Authorization': `Bearer ${groqApiKey}`, 'Content-Type': 'application/json' },
+                                body: JSON.stringify(groqBody),
+                            });
+                            if (groqRes.ok) {
+                                const groqData = await groqRes.json() as any;
+                                const reply = groqData.choices?.[0]?.message?.content?.trim();
+                                if (reply) return sendJson(res, 200, { response: reply, model: 'groq' });
+                            }
+                        } catch (err: any) {
+                            console.warn('Mentor Groq failed, trying Gemini fallback:', err.message);
+                        }
+                    }
+
+                    // Gemini fallback
+                    if (geminiApiKey) {
+                        const { GoogleGenerativeAI } = require('@google/generative-ai');
+                        const genAI = new GoogleGenerativeAI(geminiApiKey);
+                        const model = genAI.getGenerativeModel({
+                            model: 'gemini-2.0-flash-lite',
+                            generationConfig: { temperature: 0.7, maxOutputTokens: 400 },
+                        });
+                        const fullPrompt = `${systemPrompt}\n\n${historyText ? `Previous conversation:\n${historyText}\n\n` : ''}User: ${message}\n\nMentor:`;
+                        const result = await model.generateContent(fullPrompt);
+                        const reply = result.response.text().trim();
+                        if (reply) return sendJson(res, 200, { response: reply, model: 'gemini' });
+                    }
+
+                    return sendJson(res, 200, {
+                        response: "I'm having trouble connecting right now. Please check your profile is set up and try again in a moment. 🔄",
+                        model: 'fallback',
+                    });
+                } catch (err: any) {
+                    console.error('Mentor chat error:', err);
+                    sendJson(res, 500, { error: 'Mentor chat failed' });
+                }
             });
 
             // ==================== OPENAI PROXY (KEEP EXISTING) ====================

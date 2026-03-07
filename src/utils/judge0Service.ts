@@ -1,30 +1,24 @@
-// Judge0 API Integration Service
-// Provides real code execution for multiple programming languages via Judge0 (RapidAPI)
-// Uses async submission + polling for reliable results
+﻿// Judge0 API Integration Service
+// All code execution goes through the server-side proxy (/api/judge0/*)
+// The server handles AWS self-hosted instance (primary) + RapidAPI fallback.
+// NO API keys are exposed to the browser.
 
-import { API_KEYS, SECURITY_CONFIG } from '@/config/apiKeys';
+import { SECURITY_CONFIG } from '@/config/apiKeys';
+import { getAuthToken } from '@/lib/api';
 import { ProgrammingLanguage } from '@/types/coding';
 
 // Judge0 Language IDs
 // Reference: https://ce.judge0.com/#statuses-and-languages-language-get
 export const LANGUAGE_IDS: Record<ProgrammingLanguage, number> = {
-  javascript: 63,  // Node.js
-  python: 71,      // Python 3
-  java: 62,        // Java (OpenJDK 13.0.1)
-  cpp: 54,         // C++ (GCC 9.2.0)
+  javascript: 63, // Node.js
+  python: 71,     // Python 3
+  java: 62,       // Java (OpenJDK 13.0.1)
+  cpp: 54,        // C++ (GCC 9.2.0)
 };
-
-interface Judge0Submission {
-  source_code: string;
-  language_id: number;
-  stdin?: string;
-  expected_output?: string;
-  cpu_time_limit?: number;
-  memory_limit?: number;
-}
 
 interface Judge0Response {
   token: string;
+  provider?: string;
   status?: {
     id: number;
     description: string;
@@ -46,18 +40,22 @@ export interface ExecutionResult {
   statusDescription?: string;
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// --- Helpers ---
 
-const headers = () => ({
-  'Content-Type': 'application/json',
-  'x-rapidapi-key': API_KEYS.JUDGE0_API_KEY,
-  'x-rapidapi-host': API_KEYS.JUDGE0_API_HOST,
-});
+function authHeaders(): Record<string, string> {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' };
+  const token = getAuthToken();
+  if (token) h['Authorization'] = `Bearer ${token}`;
+  return h;
+}
 
 /**
  * Sanitize code input to prevent malicious code execution
  */
-const sanitizeCode = (code: string, language: ProgrammingLanguage): { sanitized: string; warnings: string[] } => {
+const sanitizeCode = (
+  code: string,
+  language: ProgrammingLanguage
+): { sanitized: string; warnings: string[] } => {
   const warnings: string[] = [];
   let sanitized = code;
 
@@ -66,7 +64,9 @@ const sanitizeCode = (code: string, language: ProgrammingLanguage): { sanitized:
   }
 
   if (code.length > SECURITY_CONFIG.MAX_CODE_LENGTH) {
-    throw new Error(`Code exceeds maximum length of ${SECURITY_CONFIG.MAX_CODE_LENGTH} characters`);
+    throw new Error(
+      `Code exceeds maximum length of ${SECURITY_CONFIG.MAX_CODE_LENGTH} characters`
+    );
   }
 
   const dangerousPatterns: Record<ProgrammingLanguage, RegExp[]> = {
@@ -74,18 +74,9 @@ const sanitizeCode = (code: string, language: ProgrammingLanguage): { sanitized:
       /require\s*\(\s*['"]child_process['"]\s*\)/gi,
       /require\s*\(\s*['"]fs['"]\s*\)/gi,
     ],
-    python: [
-      /import\s+subprocess/gi,
-      /__import__\s*\(/gi,
-    ],
-    java: [
-      /Runtime\.getRuntime\(\)/gi,
-      /ProcessBuilder/gi,
-    ],
-    cpp: [
-      /system\s*\(/gi,
-      /popen\s*\(/gi,
-    ],
+    python: [/import\s+subprocess/gi, /__import__\s*\(/gi],
+    java: [/Runtime\.getRuntime\(\)/gi, /ProcessBuilder/gi],
+    cpp: [/system\s*\(/gi, /popen\s*\(/gi],
   };
 
   const patterns = dangerousPatterns[language] || [];
@@ -96,16 +87,18 @@ const sanitizeCode = (code: string, language: ProgrammingLanguage): { sanitized:
   }
 
   // eslint-disable-next-line no-control-regex
-  sanitized = sanitized.replace(/\0/g, '').replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
+  sanitized = sanitized
+    .replace(/\0/g, '')
+    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
   return { sanitized, warnings };
 };
 
-// ─── Core: executeCode via Judge0 ──────────────────────────────────────────
+// --- Core: executeCode via server-side Judge0 proxy ---
 
 /**
- * Helper that sends source code + languageId to Judge0 POST /submissions,
- * then polls GET /submissions/:token every 2 s until the judge finishes.
- * Returns stdout on success, or stderr / compile_output on failure.
+ * Sends source code to the server-side Judge0 proxy which forwards to
+ * self-hosted AWS (primary) or RapidAPI (fallback).
+ * Polls /api/judge0/result/:token every 2 s until the judge finishes.
  */
 export const executeCode = async (
   sourceCode: string,
@@ -114,35 +107,34 @@ export const executeCode = async (
 ): Promise<ExecutionResult> => {
   const overallStart = performance.now();
 
-  // Validate API config
-  if (!API_KEYS.JUDGE0_API_KEY || !API_KEYS.JUDGE0_BASE_URL) {
-    throw new Error('Judge0 API credentials not configured. Please add VITE_JUDGE0_API_KEY and VITE_JUDGE0_BASE_URL to your .env file.');
-  }
-
-  // 1. POST the submission (no wait – we poll ourselves)
-  const submission: Judge0Submission = {
-    source_code: btoa(unescape(encodeURIComponent(sourceCode))), // safe base64 for unicode
+  // 1. POST the submission via our server proxy
+  const submission = {
+    source_code: btoa(unescape(encodeURIComponent(sourceCode))),
     language_id: languageId,
     stdin: stdin ? btoa(unescape(encodeURIComponent(stdin))) : undefined,
     cpu_time_limit: SECURITY_CONFIG.MAX_EXECUTION_TIME / 1000,
     memory_limit: 256000,
   };
 
-  const postRes = await fetch(
-    `${API_KEYS.JUDGE0_BASE_URL}/submissions?base64_encoded=true&wait=false`,
-    {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify(submission),
-    }
-  );
+  const postRes = await fetch('/api/judge0/submit', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(submission),
+  });
 
   if (!postRes.ok) {
-    const errText = await postRes.text();
-    throw new Error(`Judge0 submission failed (${postRes.status}): ${errText}`);
+    const errData = await postRes
+      .json()
+      .catch(() => ({ error: `HTTP ${postRes.status}` }));
+    throw new Error(
+      errData.error || `Judge0 submission failed (${postRes.status})`
+    );
   }
 
-  const { token } = (await postRes.json()) as Judge0Response;
+  const { token, provider } = (await postRes.json()) as {
+    token: string;
+    provider: string;
+  };
   if (!token) throw new Error('Judge0 did not return a submission token');
 
   // 2. Poll every 2 seconds, up to 30 s
@@ -153,8 +145,8 @@ export const executeCode = async (
     await new Promise((r) => setTimeout(r, POLL_INTERVAL));
 
     const getRes = await fetch(
-      `${API_KEYS.JUDGE0_BASE_URL}/submissions/${token}?base64_encoded=true&fields=*`,
-      { method: 'GET', headers: headers() }
+      `/api/judge0/result/${token}?provider=${provider}`,
+      { method: 'GET', headers: authHeaders() }
     );
 
     if (!getRes.ok) {
@@ -164,12 +156,16 @@ export const executeCode = async (
     const result: Judge0Response = await getRes.json();
     const statusId = result.status?.id ?? 0;
 
-    // 1 = In Queue, 2 = Processing → keep polling
+    // 1 = In Queue, 2 = Processing -> keep polling
     if (statusId <= 2) continue;
 
     // Decode base-64 fields
-    const stdout = result.stdout ? decodeURIComponent(escape(atob(result.stdout))) : '';
-    const stderr = result.stderr ? decodeURIComponent(escape(atob(result.stderr))) : '';
+    const stdout = result.stdout
+      ? decodeURIComponent(escape(atob(result.stdout)))
+      : '';
+    const stderr = result.stderr
+      ? decodeURIComponent(escape(atob(result.stderr)))
+      : '';
     const compileOutput = result.compile_output
       ? decodeURIComponent(escape(atob(result.compile_output)))
       : '';
@@ -203,7 +199,7 @@ export const executeCode = async (
       return {
         success: false,
         output: stdout.trim(),
-        error: 'Time Limit Exceeded – your code took too long to execute.',
+        error: 'Time Limit Exceeded - your code took too long to execute.',
         executionTime: execTimeMs,
         statusDescription: 'Time Limit Exceeded',
       };
@@ -224,7 +220,11 @@ export const executeCode = async (
     return {
       success: false,
       output: stdout.trim(),
-      error: stderr || compileOutput || result.message || `Execution finished with status: ${statusDescription}`,
+      error:
+        stderr ||
+        compileOutput ||
+        result.message ||
+        `Execution finished with status: ${statusDescription}`,
       executionTime: execTimeMs,
       statusDescription,
     };
@@ -234,13 +234,14 @@ export const executeCode = async (
   return {
     success: false,
     output: '',
-    error: 'Execution timed out – Judge0 did not return a result in 30 seconds.',
+    error:
+      'Execution timed out - Judge0 did not return a result in 30 seconds.',
     executionTime: performance.now() - overallStart,
     statusDescription: 'Timeout',
   };
 };
 
-// ─── Convenience wrapper keeping old signature ─────────────────────────────
+// --- Convenience wrapper keeping old signature ---
 
 /**
  * Submit code using ProgrammingLanguage string (resolves to Judge0 language ID).
@@ -251,7 +252,6 @@ export const submitCodeExecution = async (
   language: ProgrammingLanguage,
   input: string = ''
 ): Promise<ExecutionResult> => {
-  // Sanitize
   const { sanitized, warnings } = sanitizeCode(code, language);
   if (warnings.length > 0) console.warn('Code sanitization warnings:', warnings);
 
@@ -266,7 +266,11 @@ export const submitCodeExecution = async (
  */
 export const testJudge0Connection = async (): Promise<boolean> => {
   try {
-    const result = await submitCodeExecution('console.log("Hello, Judge0!");', 'javascript', '');
+    const result = await submitCodeExecution(
+      'console.log("Hello, Judge0!");',
+      'javascript',
+      ''
+    );
     return result.success;
   } catch {
     return false;

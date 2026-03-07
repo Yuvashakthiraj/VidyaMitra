@@ -58,11 +58,11 @@ You can return the answer in any order.`,
       },
       {
         id: 'test-4',
-        input: '-1,-2,-3,-4,-5|8',
-        expectedOutput: '-1',
+        input: '-1,-2,-3,-4,-5|-8',
+        expectedOutput: '2,4',
         isHidden: true,
         weight: 1,
-        description: 'Negative numbers with no solution (edge case)'
+        description: 'Negative numbers'
       }
     ],
     starterCode: {
@@ -1060,10 +1060,19 @@ Note: A Sudoku board (partially filled) could be valid but is not necessarily so
     testCases: [
       {
         id: 'test-1',
-        input: 'valid-board-1',
+        input: '5,3,.,.,7,.,.,.,.|6,.,.,1,9,5,.,.,.|.,9,8,.,.,.,.,6,.|8,.,.,.,6,.,.,.,3|4,.,.,8,.,3,.,.,1|7,.,.,.,2,.,.,.,6|.,6,.,.,.,.,2,8,.|.,.,.,4,1,9,.,.,5|.,.,.,.,8,.,.,7,9',
         expectedOutput: 'true',
         isHidden: false,
-        weight: 1
+        weight: 1,
+        description: 'Valid standard board'
+      },
+      {
+        id: 'test-2',
+        input: '8,3,.,.,7,.,.,.,.|6,.,.,1,9,5,.,.,.|.,9,8,.,.,.,.,6,.|8,.,.,.,6,.,.,.,3|4,.,.,8,.,3,.,.,1|7,.,.,.,2,.,.,.,6|.,6,.,.,.,.,2,8,.|.,.,.,4,1,9,.,.,5|.,.,.,.,8,.,.,7,9',
+        expectedOutput: 'false',
+        isHidden: true,
+        weight: 1,
+        description: 'Invalid board - duplicate 8 in column'
       }
     ],
     starterCode: {
@@ -1579,7 +1588,7 @@ print(remove_duplicates([1,1,2]))`,
 
   // ========== ADDITIONAL MEDIUM PROBLEMS ==========
   {
-    id: 'code-medium-6',
+    id: 'code-medium-8',
     title: 'Binary Tree Level Order Traversal',
     difficulty: 'medium',
     category: 'Trees',
@@ -1649,7 +1658,7 @@ print(level_order(create_tree([3,9,20,None,None,15,7])))`,
   },
 
   {
-    id: 'code-medium-7',
+    id: 'code-medium-9',
     title: 'Rotate Image',
     difficulty: 'medium',
     category: 'Arrays',
@@ -1727,7 +1736,7 @@ print(test)`,
 
   // ========== ADDITIONAL HARD PROBLEMS ==========
   {
-    id: 'code-hard-3',
+    id: 'code-hard-4',
     title: 'Trapping Rain Water',
     difficulty: 'hard',
     category: 'Arrays',

@@ -318,6 +318,13 @@ const WEIGHTS = {
 export async function analyzeResumeForAllRoles(file: File): Promise<RoleMatchResult[]> {
   // Extract and parse resume
   const text = await extractTextFromPDF(file);
+  return analyzeResumeForAllRolesFromText(text);
+}
+
+/**
+ * Analyzes pre-extracted resume text against all roles (no PDF parsing needed)
+ */
+export async function analyzeResumeForAllRolesFromText(text: string): Promise<RoleMatchResult[]> {
   const parsedData = parseResumeText(text);
   
   const allMatches: RoleMatchResult[] = [];

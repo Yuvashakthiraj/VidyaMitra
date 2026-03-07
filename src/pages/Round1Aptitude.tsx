@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/components/ui/use-toast';
 import { saveRound1AptitudeResult } from '@/lib/firebaseService';
+import { logActivity } from '@/utils/profileService';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { getBalancedQuestionSet, MCQQuestion } from '@/data/aptitudeQuestions';
@@ -335,6 +336,14 @@ const Round1Aptitude = () => {
             title: "Test Submitted Successfully!",
             description: "Your Round 1 aptitude test has been submitted for review.",
           });
+
+          // Log to profile activity
+          logActivity(
+            'interview',
+            'Round 1 Aptitude Completed',
+            `Role: ${roleName}, Score: ${score.percentage}% (${score.correct}/${score.total})`,
+            { roleId, roleName, score: score.percentage, correct: score.correct, total: score.total }
+          ).catch(() => {});
         } else {
           throw new Error(result.error || 'Failed to save');
         }

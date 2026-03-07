@@ -30,6 +30,7 @@ import {
   getUserInterviews, 
   updateInterview 
 } from "@/lib/firebaseService";
+import { logActivity } from "@/utils/profileService";
 
 interface InterviewContextType {
   currentInterview: InterviewSession | null;
@@ -387,6 +388,17 @@ export const InterviewProvider = ({ children }: { children: ReactNode }) => {
       // Navigate based on interview type
       // For formal (monitored) interviews: show thank you page
       // For practice interviews: show summary immediately
+
+      // Log to profile activity
+      const interviewType = completedInterview.isPracticeMode ? 'practice' : 'interview';
+      const roleName = selectedRole?.title || completedInterview.roleId || 'Unknown Role';
+      logActivity(
+        interviewType,
+        completedInterview.isPracticeMode ? 'Practice Interview Completed' : 'Mock Interview Completed',
+        `Role: ${roleName}, Score: ${score}%`,
+        { roleId: completedInterview.roleId, score, outcome, isPracticeMode: completedInterview.isPracticeMode }
+      ).catch(() => {});
+
       setTimeout(() => {
         if (!completedInterview.isPracticeMode) {
           navigate('/interview-thank-you');

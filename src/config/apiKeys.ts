@@ -6,7 +6,9 @@
  * - VITE_GEMINI_API_KEY (main Gemini API key)
  * - VITE_GEMINI_CHATBOT_API_KEY (chatbot service)
  * - VITE_GEMINI_FRIEDE_API_KEY (FRIEDE bot interview)
- * - VITE_JUDGE0_API_KEY (Judge0 code execution)
+ * 
+ * Judge0 keys are server-side only (JUDGE0_HOST, JUDGE0_RAPIDAPI_KEY)
+ * Code execution goes through /api/judge0/* proxy endpoints.
  */
 
 // Get API keys from environment variables without fallbacks for security
@@ -29,10 +31,11 @@ export const API_KEYS = {
   // FRIEDE bot interview API key
   GEMINI_FRIEDE: getEnvVar('VITE_GEMINI_FRIEDE_API_KEY'),
   
-  // Judge0 API Configuration
-  JUDGE0_API_KEY: getEnvVar('VITE_JUDGE0_API_KEY'),
-  JUDGE0_API_HOST: getEnvVar('VITE_JUDGE0_API_HOST'),
-  JUDGE0_BASE_URL: getEnvVar('VITE_JUDGE0_BASE_URL'),
+  // Judge0 keys are now server-side only (no VITE_ prefix)
+  // Code execution goes through /api/judge0/* proxy
+  
+  // ElevenLabs Conversational AI (agent ID is public, API key stays server-side)
+  ELEVENLABS_AGENT_ID: getEnvVar('VITE_ELEVENLABS_AGENT_ID', false),
 } as const;
 
 // Rate limiting configuration shared across all services
