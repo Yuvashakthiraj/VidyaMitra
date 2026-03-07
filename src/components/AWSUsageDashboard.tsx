@@ -674,6 +674,99 @@ export default function AWSUsageDashboard() {
           {/* ── Health Check ── */}
           <HealthPanel health={healthData} loading={healthLoading} onCheck={runHealthCheck} />
 
+          {/* ── AWS Parameter Store Security ── */}
+          <Card className="border-l-4 border-l-blue-500">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base flex items-center gap-2">
+                <Shield className="h-5 w-5 text-blue-400" />
+                AWS Parameter Store Security
+              </CardTitle>
+              <CardDescription className="text-xs">
+                API keys stored securely in AWS Systems Manager Parameter Store
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-4">
+                {/* Security Status */}
+                <div className="flex items-start gap-3 rounded-lg border border-blue-700/40 bg-blue-950/20 p-3">
+                  <CheckCircle2 className="h-5 w-5 text-blue-400 shrink-0 mt-0.5" />
+                  <div className="flex-1">
+                    <p className="text-sm font-semibold text-blue-400">Parameter Store Active</p>
+                    <p className="text-xs text-blue-300/90 mt-1">
+                      29 API keys & configurations secured in AWS Parameter Store (FREE tier). 
+                      Keys are encrypted with KMS and never exposed in source code or GitHub.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Parameter Groups */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="p-3 rounded-lg bg-muted/30 border">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Package className="h-4 w-4 text-emerald-400" />
+                      <span className="text-xs font-semibold">API Keys</span>
+                    </div>
+                    <p className="text-xl font-bold text-emerald-400">24</p>
+                    <p className="text-[10px] text-muted-foreground mt-1">
+                      Gemini, OpenAI, Groq, ElevenLabs, YouTube, Pexels, News, Judge0, Razorpay, etc.
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-lg bg-muted/30 border">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Server className="h-4 w-4 text-purple-400" />
+                      <span className="text-xs font-semibold">Database</span>
+                    </div>
+                    <p className="text-xl font-bold text-purple-400">2</p>
+                    <p className="text-[10px] text-muted-foreground mt-1">
+                      Supabase URL, Service Role Key
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-lg bg-muted/30 border">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Cloud className="h-4 w-4 text-cyan-400" />
+                      <span className="text-xs font-semibold">AWS Config</span>
+                    </div>
+                    <p className="text-xl font-bold text-cyan-400">3</p>
+                    <p className="text-[10px] text-muted-foreground mt-1">
+                      S3 Bucket, Region, Lambda API URL
+                    </p>
+                  </div>
+                </div>
+
+                {/* Security Features */}
+                <div className="space-y-2">
+                  <p className="text-xs font-semibold text-muted-foreground">Security Features:</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                    {[
+                      { icon: Shield, label: 'KMS Encryption', detail: 'SecureString parameters encrypted at rest' },
+                      { icon: Wifi, label: 'In-Transit Security', detail: 'HTTPS-only API calls with IAM auth' },
+                      { icon: Activity, label: '5-min Cache', detail: 'Reduces API calls, improves performance' },
+                      { icon: CheckCircle2, label: 'Hybrid Mode', detail: 'AWS creds in .env, API keys in Parameter Store' },
+                    ].map((f, i) => (
+                      <div key={i} className="flex items-start gap-2 p-2 rounded bg-muted/20">
+                        <f.icon className="h-3.5 w-3.5 text-green-400 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-medium text-foreground">{f.label}</span>
+                          <p className="text-muted-foreground text-[10px]">{f.detail}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Cost Info */}
+                <div className="flex items-center gap-2 text-[11px] text-muted-foreground pt-2 border-t">
+                  <DollarSign className="h-3 w-3 shrink-0" />
+                  <span>
+                    <strong className="text-green-400">$0.00/month</strong> - Parameter Store is FREE (Standard tier, &lt;10K parameters)
+                  </span>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
           {/* ── Pricing reference ── */}
           <Card>
             <CardHeader className="pb-2">

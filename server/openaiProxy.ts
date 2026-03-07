@@ -11,6 +11,7 @@
 import type { Plugin, ViteDevServer } from 'vite';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { loadEnv } from 'vite';
+import { loadEnvWithSecrets } from './secretsManager';
 import path from 'path';
 
 // ==================== RATE LIMITING ====================
@@ -570,9 +571,11 @@ export function openaiProxyPlugin(): Plugin {
   return {
     name: 'openai-proxy',
 
-    configResolved(config) {
+    async configResolved(config) {
       // Load env vars (including non-VITE_ prefixed ones) for the server
-      const env = loadEnv(config.mode, config.root, '');
+      const baseEnv = loadEnv(config.mode, config.root, '');
+      // Load secrets from AWS Secrets Manager (if enabled) or fallback to .env
+      const env = await loadEnvWithSecrets(baseEnv);
       apiKey = env.OPENAI_API_KEY || '';
 
       if (apiKey) {

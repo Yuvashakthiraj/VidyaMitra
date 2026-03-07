@@ -15,6 +15,7 @@ import { registerAwsUsageRoutes } from './awsUsageRoutes';
 import { registerSNSRoutes, initSNS } from './snsRoutes';
 import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
 import { trackSESEmail } from './awsUsageCounter';
+import { loadEnvWithSecrets } from './secretsManager';
 
 // ==================== TYPES ====================
 interface ApiKeys {
@@ -666,8 +667,10 @@ export function vidyaMitraApiPlugin(): Plugin {
     return {
         name: 'vidyamitra-api',
 
-        configResolved(config) {
-            const env = loadEnv(config.mode, config.root, '');
+        async configResolved(config) {
+            const baseEnv = loadEnv(config.mode, config.root, '');
+            // Load secrets from AWS Secrets Manager (if enabled) or fallback to .env
+            const env = await loadEnvWithSecrets(baseEnv);
             resolvedEnv = env;
             keys = {
                 GEMINI_API_KEY: env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY || '',
