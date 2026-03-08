@@ -1,56 +1,24 @@
-/**
+﻿/**
  * AWS Usage & Cost Tracking Routes
  *
- * Provides a unified view of all AWS services configured for VidyaMitra.
- * Services are AUTO-DETECTED from environment variables — adding a new AWS
- * service to the env will automatically surface it in the dashboard.
+ * Active AWS services: Rekognition, SSM Parameter Store, S3, Lambda.
  *
  * Endpoints:
- *   GET /api/aws/usage        — full usage snapshot for all detected services
- *   GET /api/aws/health       — quick connectivity check per service
+ *   GET /api/aws/usage        - usage snapshot for active services
+ *   GET /api/aws/health       - quick connectivity check per service
  */
 
 import type { ViteDevServer } from 'vite';
 import type { IncomingMessage, ServerResponse } from 'http';
-import {
-  CloudWatchClient,
-  GetMetricStatisticsCommand,
-} from '@aws-sdk/client-cloudwatch';
-import {
-  LambdaClient,
-  GetFunctionConfigurationCommand,
-  ListFunctionsCommand,
-} from '@aws-sdk/client-lambda';
-import { S3Client, ListObjectsV2Command, GetBucketLocationCommand } from '@aws-sdk/client-s3';
-import {
-  SNSClient,
-  ListTopicsCommand,
-  ListSubscriptionsByTopicCommand,
-  GetTopicAttributesCommand,
-} from '@aws-sdk/client-sns';
+import { RekognitionClient, DescribeCollectionCommand } from '@aws-sdk/client-rekognition';
+import { SSMClient, DescribeParametersCommand } from '@aws-sdk/client-ssm';
+import { S3Client, HeadBucketCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import { LambdaClient, GetFunctionCommand } from '@aws-sdk/client-lambda';
+import { CostExplorerClient, GetCostAndUsageCommand } from '@aws-sdk/client-cost-explorer';
+import { CloudWatchClient, GetMetricStatisticsCommand } from '@aws-sdk/client-cloudwatch';
+import { getUsageStats } from './awsUsageCounter';
 
-// ── Pricing constants (public AWS pricing. Update if rates change.) ───────────
-const PRICING = {
-  s3_storage_per_gb:     0.023,   // Standard storage $/GB/month (first 50 TB)
-  s3_put_per_1000:       0.005,   // PUT/COPY/POST/LIST per 1,000
-  s3_get_per_1000:       0.0004,  // GET per 1,000
-  lambda_per_1M:         0.20,    // Per 1M requests (after free tier)
-  lambda_gb_sec:         0.0000166667, // Per GB-second (after free tier)
-  lambda_free_requests:  1_000_000,
-  lambda_free_gb_sec:    400_000,
-  textract_per_page_sync:      0.0015, // Synchronous DetectDocumentText $/page
-  textract_free_pages:         1_000,  // /month
-  apigw_per_1M:          3.50,   // REST API $/million calls
-  apigw_free:            1_000_000, // Per month
-  rekognition_per_1000:  0.001,   // DetectFaces $/1000 images (after free tier 1K/month)
-  rekognition_free:      1_000,
-  sns_per_1M_email:      2.00,   // Email notifications $/1M (after free 1K/month)
-  sns_per_1M_sms:        0.00645, // SMS (US) per message
-  sns_free_email:        1_000,   // Free tier per month
-  ses_per_1000:          0.10,    // $0.10 per 1,000 emails
-};
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
+//  Helpers 
 
 function makeAwsCreds(env: Record<string, string>) {
   return {
@@ -64,100 +32,327 @@ function getRegion(env: Record<string, string>) {
   return env.AWS_REGION || process.env.AWS_REGION || 'us-east-1';
 }
 
-/** Parse past N days as [start, end] Date objects */
-function getDateRange(days = 7): [Date, Date] {
-  const end = new Date();
-  const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
-  return [start, end];
+function monthStart(): Date {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 }
 
-/** Extract CloudWatch Sum for a given metric over the past `days` */
-async function cwSum(
-  cw: CloudWatchClient,
+// -- CloudWatch metric helper -------------------------------------------------
+
+async function cwMetricSum(
+  creds: ReturnType<typeof makeAwsCreds>,
+  region: string,
   namespace: string,
   metricName: string,
-  dimensions: Array<{ Name: string; Value: string }>,
-  days = 7
+  dimensions: { Name: string; Value: string }[],
+  stat: 'Sum' | 'Maximum' = 'Sum',
 ): Promise<number> {
-  const [start, end] = getDateRange(days);
   try {
-    const cmd = new GetMetricStatisticsCommand({
+    const cw = new CloudWatchClient({ region, credentials: creds });
+    const start = monthStart();
+    const end = new Date();
+    if (end.getTime() - start.getTime() < 60_000) return 0; // too close to month boundary
+
+    const res = await cw.send(new GetMetricStatisticsCommand({
       Namespace: namespace,
       MetricName: metricName,
       Dimensions: dimensions,
       StartTime: start,
       EndTime: end,
-      Period: days * 86400, // single bucket over the period
-      Statistics: ['Sum'],
-    });
-    const resp = await cw.send(cmd);
-    return resp.Datapoints?.[0]?.Sum ?? 0;
+      Period: 86400,      // 1-day buckets
+      Statistics: [stat],
+    }));
+    const points = res.Datapoints ?? [];
+    if (stat === 'Maximum') {
+      // Take the most recent maximum (for billing metrics)
+      const sorted = [...points].sort((a, b) => (b.Timestamp?.getTime() ?? 0) - (a.Timestamp?.getTime() ?? 0));
+      return sorted[0]?.Maximum ?? 0;
+    }
+    return points.reduce((s, d) => s + (d.Sum ?? 0), 0);
   } catch {
     return 0;
   }
 }
 
-/** Extract CloudWatch Average for a metric */
-async function cwAvg(
-  cw: CloudWatchClient,
-  namespace: string,
-  metricName: string,
-  dimensions: Array<{ Name: string; Value: string }>,
-  days = 7
-): Promise<number> {
-  const [start, end] = getDateRange(days);
+// -- Multi-strategy cost fetching ---------------------------------------------
+// Priority:
+//   1. CloudWatch AWS/Billing EstimatedCharges (real charges, if billing alerts enabled)
+//   2. Cost Explorer (non-Learner-Lab accounts only)
+//   3. Detailed per-service CloudWatch metrics + price calculation
+//   4. S3: exact size from bucket listing (always available)
+
+const CE_SERVICE_MAP: Record<string, string> = {
+  'Amazon Simple Storage Service':          's3',
+  'AWS Lambda':                             'lambda',
+  'Amazon Rekognition':                     'rekognition',
+  'AWS Systems Manager':                    'ssm',
+  'AWS Secrets Manager':                    'secretsManager',
+  'Amazon Simple Notification Service':     'sns',
+  'Amazon Simple Email Service':            'ses',
+};
+
+// Strategy 1: CloudWatch AWS/Billing (updated daily, works if billing alerts enabled)
+async function getBillingFromCloudWatch(env: Record<string, string>): Promise<Record<string, number> | null> {
+  const creds = makeAwsCreds(env);
+  if (!creds.accessKeyId) return null;
+
+  // Billing metrics are always in us-east-1
+  const total = await cwMetricSum(creds, 'us-east-1', 'AWS/Billing', 'EstimatedCharges',
+    [{ Name: 'Currency', Value: 'USD' }], 'Maximum');
+
+  if (total === 0) return null; // billing alerts disabled or no charges yet
+
+  const costs: Record<string, number> = { total };
+
+  const serviceNames: Record<string, string> = {
+    'Amazon Simple Storage Service': 's3',
+    'AWS Lambda': 'lambda',
+    'Amazon Rekognition': 'rekognition',
+    'AWS Systems Manager': 'ssm',
+    'Amazon Simple Notification Service': 'sns',
+    'Amazon Simple Email Service': 'ses',
+  };
+  for (const [awsName, key] of Object.entries(serviceNames)) {
+    const cost = await cwMetricSum(creds, 'us-east-1', 'AWS/Billing', 'EstimatedCharges', [
+      { Name: 'Currency', Value: 'USD' },
+      { Name: 'ServiceName', Value: awsName },
+    ], 'Maximum');
+    costs[key] = cost;
+  }
+  return costs;
+}
+
+// Strategy 2: Cost Explorer (blocked in Learner Lab — silently returns null)
+async function getBillingFromCostExplorer(env: Record<string, string>): Promise<Record<string, number> | null> {
+  const creds = makeAwsCreds(env);
+  if (!creds.accessKeyId) return null;
   try {
-    const cmd = new GetMetricStatisticsCommand({
-      Namespace: namespace,
-      MetricName: metricName,
-      Dimensions: dimensions,
-      StartTime: start,
-      EndTime: end,
-      Period: days * 86400,
-      Statistics: ['Average'],
-    });
-    const resp = await cw.send(cmd);
-    return resp.Datapoints?.[0]?.Average ?? 0;
+    const ce = new CostExplorerClient({ region: 'us-east-1', credentials: creds });
+    const now = new Date();
+    const startDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+    const endDate = now.toISOString().split('T')[0];
+    if (startDate === endDate) return null;
+
+    const result = await ce.send(new GetCostAndUsageCommand({
+      TimePeriod: { Start: startDate, End: endDate },
+      Granularity: 'MONTHLY',
+      Metrics: ['UnblendedCost'],
+      GroupBy: [{ Type: 'DIMENSION', Key: 'SERVICE' }],
+    }));
+    const costs: Record<string, number> = {};
+    let totalCost = 0;
+    for (const group of result.ResultsByTime?.[0]?.Groups ?? []) {
+      const amount = parseFloat(group.Metrics?.UnblendedCost?.Amount ?? '0');
+      const key = CE_SERVICE_MAP[group.Keys?.[0] ?? ''];
+      if (key) costs[key] = (costs[key] ?? 0) + amount;
+      totalCost += amount;
+    }
+    if (totalCost === 0) return null;
+    costs['total'] = totalCost;
+    return costs;
   } catch {
-    return 0;
+    return null;
   }
 }
 
-/** Get daily datapoints for charting (1 point per day) */
-async function cwDaily(
-  cw: CloudWatchClient,
-  namespace: string,
-  metricName: string,
-  dimensions: Array<{ Name: string; Value: string }>,
-  days = 7
-): Promise<Array<{ date: string; value: number }>> {
-  const [start, end] = getDateRange(days);
+// Strategy 3: Per-service CloudWatch usage metrics + AWS pricing calculation
+// This works in Learner Lab — these are operational metrics, not billing metrics.
+interface CWUsageMetrics {
+  // Lambda
+  lambdaInvocations: number;
+  lambdaDurationMs: number;      // Sum of Duration (ms) for the month
+  // Rekognition
+  rekognitionRequests: number;
+  // S3 request metrics (CloudWatch, best-effort)
+  s3GetRequests: number;
+  s3PutRequests: number;
+}
+
+async function getPerServiceCWMetrics(
+  env: Record<string, string>,
+  functionName: string,
+): Promise<CWUsageMetrics> {
+  const creds = makeAwsCreds(env);
+  const region = getRegion(env);
+  const bucketName = env.S3_BUCKET_NAME || process.env.S3_BUCKET_NAME || 'vidyamitra-uploads-629496';
+
+  const [lambdaInvocations, lambdaDurationMs, rekognitionRequests, s3GetRequests, s3PutRequests] = await Promise.all([
+    cwMetricSum(creds, region, 'AWS/Lambda', 'Invocations', [{ Name: 'FunctionName', Value: functionName }]),
+    cwMetricSum(creds, region, 'AWS/Lambda', 'Duration',    [{ Name: 'FunctionName', Value: functionName }]),
+    // Rekognition: Number of successful API calls
+    cwMetricSum(creds, region, 'AWS/Rekognition', 'SuccessfulRequestCount', []),
+    // S3 request metrics (available if request metrics enabled on bucket — best effort)
+    cwMetricSum(creds, region, 'AWS/S3', 'GetRequests', [
+      { Name: 'BucketName', Value: bucketName },
+      { Name: 'FilterId', Value: 'EntireBucket' },
+    ]),
+    cwMetricSum(creds, region, 'AWS/S3', 'PutRequests', [
+      { Name: 'BucketName', Value: bucketName },
+      { Name: 'FilterId', Value: 'EntireBucket' },
+    ]),
+  ]);
+
+  return { lambdaInvocations, lambdaDurationMs, rekognitionRequests, s3GetRequests, s3PutRequests };
+}
+
+function computeLambdaCost(invocations: number, durationMs: number, memoryMB: number): number {
+  const FREE_REQUESTS = 1_000_000;
+  const FREE_GB_SECONDS = 400_000;
+  const gbSeconds = (durationMs / 1000) * (memoryMB / 1024);
+  const requestCost = Math.max(0, invocations - FREE_REQUESTS) * 0.0000002;
+  const durationCost = Math.max(0, gbSeconds - FREE_GB_SECONDS) * 0.0000166667;
+  return requestCost + durationCost;
+}
+
+function computeRekognitionCost(requests: number, inMemoryCount: number): number {
+  const total = Math.max(requests, inMemoryCount); // use whichever is higher
+  return Math.max(0, total - 1_000) * 0.001;      // first 1,000/month free
+}
+
+function computeS3Cost(totalSizeBytes: number, cwGetRequests: number, cwPutRequests: number, sessionCounters: ReturnType<typeof getUsageStats>): number {
+  const totalSizeGB = totalSizeBytes / (1024 ** 3);
+  const storageCost = Math.max(0, totalSizeGB - 5) * 0.023; // first 5 GB free
+
+  // Use CloudWatch metrics if available, else fall back to in-memory counters
+  const getReqs  = cwGetRequests  > 0 ? cwGetRequests  : sessionCounters.s3Download + sessionCounters.s3List;
+  const putReqs  = cwPutRequests  > 0 ? cwPutRequests  : sessionCounters.s3Upload;
+  const getCost  = Math.max(0, getReqs  - 20_000) * 0.0000004;
+  const putCost  = Math.max(0, putReqs  -  2_000) * 0.000005;
+  return storageCost + getCost + putCost;
+}
+
+// Master function: tries all strategies in priority order
+async function fetchCostData(env: Record<string, string>, functionName: string): Promise<{
+  billedCosts: Record<string, number> | null;
+  cwMetrics: CWUsageMetrics;
+  costSource: string;
+}> {
+  // Run billing strategies and CW metrics in parallel
+  const [cwBilling, ceCosts, cwMetrics] = await Promise.all([
+    getBillingFromCloudWatch(env),
+    getBillingFromCostExplorer(env),
+    getPerServiceCWMetrics(env, functionName),
+  ]);
+
+  if (cwBilling) {
+    return { billedCosts: cwBilling, cwMetrics, costSource: 'CloudWatch Billing Metrics (actual charges, updated daily)' };
+  }
+  if (ceCosts) {
+    return { billedCosts: ceCosts, cwMetrics, costSource: 'AWS Cost Explorer (actual billed)' };
+  }
+  return { billedCosts: null, cwMetrics, costSource: 'CloudWatch Usage Metrics + AWS Pricing (Learner Lab)' };
+}
+
+// -- Rekognition Stats --------------------------------------------------------
+
+async function getRekognitionStats(
+  env: Record<string, string>,
+  billedCosts: Record<string, number> | null,
+  cwMetrics: CWUsageMetrics,
+  costSource: string,
+) {
+  const creds = makeAwsCreds(env);
+  const region = getRegion(env);
+  const collectionId = env.REKOGNITION_COLLECTION_ID || process.env.REKOGNITION_COLLECTION_ID || '';
+
+  if (!creds.accessKeyId) return null;
+
+  const rekognition = new RekognitionClient({ region, credentials: creds });
+  const sessionCounter = getUsageStats().rekognitionAnalysis;
+
   try {
-    const cmd = new GetMetricStatisticsCommand({
-      Namespace: namespace,
-      MetricName: metricName,
-      Dimensions: dimensions,
-      StartTime: start,
-      EndTime: end,
-      Period: 86400, // 1 day
-      Statistics: ['Sum'],
-    });
-    const resp = await cw.send(cmd);
-    const points = (resp.Datapoints ?? [])
-      .sort((a, b) => (a.Timestamp?.getTime() ?? 0) - (b.Timestamp?.getTime() ?? 0))
-      .map(d => ({
-        date: d.Timestamp!.toISOString().slice(0, 10),
-        value: d.Sum ?? 0,
-      }));
-    return points;
-  } catch {
-    return [];
+    let faceCount = 0;
+    if (collectionId) {
+      const desc = await rekognition.send(new DescribeCollectionCommand({ CollectionId: collectionId }));
+      faceCount = desc.FaceCount ?? 0;
+    }
+
+    const monthlyCostEstimate = billedCosts?.rekognition
+      ?? computeRekognitionCost(cwMetrics.rekognitionRequests, sessionCounter);
+
+    const requestCount = Math.max(cwMetrics.rekognitionRequests, sessionCounter);
+
+    return {
+      service: 'Rekognition',
+      status: 'ok' as const,
+      region,
+      collectionId: collectionId || 'not configured',
+      faceCount,
+      requestCount,
+      costs: {
+        monthlyCostEstimate,
+        costSource,
+        freeTierNote: 'First 1,000 face analyses/month free. $0.001 per 1,000 images after that.',
+      },
+    };
+  } catch (err: any) {
+    return {
+      service: 'Rekognition',
+      status: 'error' as const,
+      error: err?.message || 'Failed to fetch Rekognition stats',
+      region,
+      collectionId: collectionId || 'not configured',
+    };
   }
 }
 
-// ─── S3 Stats ────────────────────────────────────────────────────────────────
+// -- SSM Parameter Store Stats ------------------------------------------------
 
-async function getS3Stats(env: Record<string, string>, isLearnerLab = false) {
+async function getSSMStats(
+  env: Record<string, string>,
+  billedCosts: Record<string, number> | null,
+  costSource: string,
+) {
+  const creds = makeAwsCreds(env);
+  const region = getRegion(env);
+
+  if (!creds.accessKeyId) return null;
+
+  const ssm = new SSMClient({ region, credentials: creds });
+
+  try {
+    const resp = await ssm.send(new DescribeParametersCommand({ MaxResults: 50 }));
+    const paramCount = resp.Parameters?.length ?? 0;
+    // Standard SSM parameters are always free; Advanced parameters cost $0.05/param/month
+    const monthlyCostEstimate = billedCosts?.ssm ?? 0;
+    return {
+      service: 'SSM Parameter Store',
+      status: 'ok' as const,
+      region,
+      parameterCount: paramCount,
+      costs: {
+        monthlyCostEstimate,
+        costSource: billedCosts?.ssm !== undefined ? costSource : 'Standard params are FREE',
+        freeTierNote: 'Standard parameters are FREE (up to 10,000 parameters, unlimited API calls).',
+      },
+    };
+  } catch (err: any) {
+    return {
+      service: 'SSM Parameter Store',
+      status: 'error' as const,
+      error: err?.message || 'Failed to fetch SSM stats',
+      region,
+    };
+  }
+}
+
+// -- S3 Stats -----------------------------------------------------------------
+
+function getLambdaFunctionName(env: Record<string, string>): string {
+  const apiUrl = env.AWS_LAMBDA_RESUME_API || process.env.AWS_LAMBDA_RESUME_API || '';
+  if (apiUrl) {
+    const parts = apiUrl.split('/').filter(Boolean);
+    if (parts.length > 0) return parts[parts.length - 1];
+  }
+  return 'vidyamitra-textract-resume';
+}
+
+async function getS3Stats(
+  env: Record<string, string>,
+  billedCosts: Record<string, number> | null,
+  cwMetrics: CWUsageMetrics,
+  costSource: string,
+) {
   const creds = makeAwsCreds(env);
   const region = getRegion(env);
   const bucketName = env.S3_BUCKET_NAME || process.env.S3_BUCKET_NAME || 'vidyamitra-uploads-629496';
@@ -165,364 +360,151 @@ async function getS3Stats(env: Record<string, string>, isLearnerLab = false) {
   if (!creds.accessKeyId) return null;
 
   const s3 = new S3Client({ region, credentials: creds });
-  const cw = new CloudWatchClient({ region, credentials: creds });
-
-  let objectCount = 0;
-  let totalSizeBytes = 0;
-  const folderBreakdown: Record<string, { count: number; sizeBytes: number }> = {};
-
-  // Count objects per folder prefix
-  const prefixes = ['resumes/', 'profile-pictures/', 'institution-logos/', 'exports/', ''];
-  for (const prefix of prefixes) {
-    try {
-      let token: string | undefined;
-      do {
-        const resp = await s3.send(new ListObjectsV2Command({
-          Bucket: bucketName,
-          Prefix: prefix,
-          MaxKeys: 1000,
-          ContinuationToken: token,
-        }));
-        const contents = resp.Contents ?? [];
-        // Only count objects directly in this prefix (avoid double-counting for '')
-        for (const obj of contents) {
-          const key = obj.Key ?? '';
-          const isTopLevel = prefix === '' && !prefixes.slice(0, -1).some(p => key.startsWith(p));
-          if (prefix !== '' || isTopLevel) {
-            objectCount++;
-            totalSizeBytes += obj.Size ?? 0;
-            const folder = prefix || 'root';
-            if (!folderBreakdown[folder]) folderBreakdown[folder] = { count: 0, sizeBytes: 0 };
-            folderBreakdown[folder].count++;
-            folderBreakdown[folder].sizeBytes += obj.Size ?? 0;
-          }
-        }
-        token = resp.IsTruncated ? resp.NextContinuationToken : undefined;
-      } while (token);
-    } catch {
-      // Skip inaccessible prefix
-    }
-  }
-
-  // CloudWatch S3 metrics (BucketSizeBytes & NumberOfObjects — only available with daily metrics enabled)
-  const cwBytes = await cwSum(cw, 'AWS/S3', 'BucketSizeBytes',
-    [{ Name: 'BucketName', Value: bucketName }, { Name: 'StorageType', Value: 'StandardStorage' }], 1);
-  const cwObjects = await cwSum(cw, 'AWS/S3', 'NumberOfObjects',
-    [{ Name: 'BucketName', Value: bucketName }, { Name: 'StorageType', Value: 'AllStorageTypes' }], 1);
-
-  // Use CW values if available, otherwise fall back to what we counted
-  const finalObjects = cwObjects > 0 ? cwObjects : objectCount;
-  const finalBytes = cwBytes > 0 ? cwBytes : totalSizeBytes;
-  const sizeGB = finalBytes / (1024 ** 3);
-
-  // Cost estimate: AWS Learner Labs has NO free tier - all usage is billable
-  const freeTierGB = isLearnerLab ? 0 : 5; // Regular AWS has 5GB free, Learner Lab has 0
-  const billableGB = Math.max(0, sizeGB - freeTierGB);
-  const storageCost = billableGB * PRICING.s3_storage_per_gb;
-
-  return {
-    service: 'S3',
-    icon: 'cloud',
-    color: 'orange',
-    status: 'ok',
-    bucket: bucketName,
-    region,
-    metrics: {
-      objectCount: finalObjects,
-      sizeGB: +sizeGB.toFixed(4),
-      sizeMB: +(finalBytes / (1024 ** 2)).toFixed(2),
-      folderBreakdown,
-    },
-    costs: {
-      storageCostMonthly: +storageCost.toFixed(4),
-      freeTierNote: isLearnerLab 
-        ? 'AWS Learner Lab: NO free tier. All storage billable from first byte.'
-        : 'First 5 GB/month free. PUT/GET: 2K PUT + 20K GET free/month.',
-    },
-  };
-}
-
-// ─── Lambda (Textract Resume) Stats ──────────────────────────────────────────
-
-async function getLambdaStats(env: Record<string, string>, isLearnerLab = false) {
-  const creds = makeAwsCreds(env);
-  const region = getRegion(env);
-  const lambdaApiUrl = env.AWS_LAMBDA_RESUME_API || process.env.AWS_LAMBDA_RESUME_API || '';
-
-  if (!creds.accessKeyId || !lambdaApiUrl) return null;
-
-  // Extract function name from API Gateway URL
-  // Format: https://{api-id}.execute-api.{region}.amazonaws.com/{stage}/{function-name}
-  const urlParts = lambdaApiUrl.split('/');
-  const functionName = urlParts[urlParts.length - 1] || '';
-  const apiId = lambdaApiUrl.split('.')[0].replace('https://', '');
-  const stage = urlParts[urlParts.length - 2] || 'default';
-
-  const cw = new CloudWatchClient({ region, credentials: creds });
-  const lambda = new LambdaClient({ region, credentials: creds });
-
-  // Get Lambda function config  
-  let memoryMB = 128;
-  let timeoutSec = 30;
-  let runtime = 'nodejs';
-  let lastModified = '';
-  try {
-    const config = await lambda.send(new GetFunctionConfigurationCommand({ FunctionName: functionName }));
-    memoryMB = config.MemorySize ?? 128;
-    timeoutSec = config.Timeout ?? 30;
-    runtime = config.Runtime ?? 'nodejs';
-    lastModified = config.LastModified ?? '';
-  } catch {
-    // Function may be inaccessible — use defaults
-  }
-
-  const lambdaDims = [{ Name: 'FunctionName', Value: functionName }];
-  const apigwDims = [{ Name: 'ApiId', Value: apiId }, { Name: 'Stage', Value: stage }];
-
-  const [invocations, errors, throttles, avgDurationMs, dailyInvocations, apigwCount] = await Promise.all([
-    cwSum(cw, 'AWS/Lambda', 'Invocations',  lambdaDims),
-    cwSum(cw, 'AWS/Lambda', 'Errors',       lambdaDims),
-    cwSum(cw, 'AWS/Lambda', 'Throttles',    lambdaDims),
-    cwAvg(cw, 'AWS/Lambda', 'Duration',     lambdaDims),
-    cwDaily(cw, 'AWS/Lambda', 'Invocations', lambdaDims),
-    cwSum(cw, 'AWS/ApiGateway', 'Count',    apigwDims),
-  ]);
-
-  const errorRate = invocations > 0 ? (errors / invocations) * 100 : 0;
-
-  // Cost estimate (7 days → scale to monthly)
-  // AWS Learner Labs has NO free tier - all requests/compute are billable
-  const freeTierRequests = isLearnerLab ? 0 : PRICING.lambda_free_requests;
-  const freeTierGbSec = isLearnerLab ? 0 : PRICING.lambda_free_gb_sec;
-  const freeTierTextractPages = isLearnerLab ? 0 : PRICING.textract_free_pages;
-
-  const monthlyInvocations = Math.round(invocations * (30 / 7));
-  const billableRequests = Math.max(0, monthlyInvocations - freeTierRequests);
-  const requestCost = (billableRequests / 1_000_000) * PRICING.lambda_per_1M;
-
-  const gbSeconds = invocations * (avgDurationMs / 1000) * (memoryMB / 1024);
-  const monthlyGbSec = gbSeconds * (30 / 7);
-  const billableGbSec = Math.max(0, monthlyGbSec - freeTierGbSec);
-  const computeCost = billableGbSec * PRICING.lambda_gb_sec;
-
-  // Textract pages ~ 1 per Lambda invocation
-  const textractPages = Math.round(invocations * (30 / 7)); // Monthly estimate
-  const billableTextractPages = Math.max(0, textractPages - freeTierTextractPages);
-  const textractCost = billableTextractPages * PRICING.textract_per_page_sync;
-
-  return {
-    service: 'Lambda + Textract',
-    icon: 'zap',
-    color: 'yellow',
-    status: 'ok',
-    functionName,
-    apiId,
-    stage,
-    region,
-    runtime,
-    memoryMB,
-    timeoutSec,
-    lastModified,
-    apiGatewayUrl: lambdaApiUrl,
-    metrics: {
-      invocations7d:   invocations,
-      errors7d:        errors,
-      throttles7d:     throttles,
-      errorRate:       +errorRate.toFixed(2),
-      avgDurationMs:   +avgDurationMs.toFixed(0),
-      apigwRequests7d: apigwCount,
-      dailyInvocations,
-    },
-    costs: {
-      lambdaMonthlyEstimate: +(requestCost + computeCost).toFixed(4),
-      textractMonthlyEstimate: +textractCost.toFixed(4),
-      totalMonthlyEstimate: +(requestCost + computeCost + textractCost).toFixed(4),
-      freeTierNote: isLearnerLab
-        ? 'AWS Learner Lab: NO free tier. All Lambda requests, compute, and Textract pages are billable.'
-        : 'Lambda: 1M req + 400K GB-sec/month free. Textract: 1K pages/month free.',
-    },
-  };
-}
-
-// ─── SNS (Marketing Notifications) Stats ─────────────────────────────────────
-
-async function getSNSStats(env: Record<string, string>, isLearnerLab = false) {
-  const creds = makeAwsCreds(env);
-  const region = getRegion(env);
-
-  if (!creds.accessKeyId) return null;
-
-  const sns = new SNSClient({ region, credentials: creds });
-  const cw = new CloudWatchClient({ region, credentials: creds });
+  const counters = getUsageStats();
 
   try {
-    // List all topics (filter for VidyaMitra topics)
-    const topicsResp = await sns.send(new ListTopicsCommand({}));
-    const allTopics = topicsResp.Topics || [];
-    const vidyamitraTopics = allTopics.filter(t => t.TopicArn?.includes('vidyamitra'));
+    await s3.send(new HeadBucketCommand({ Bucket: bucketName }));
 
-    let totalSubscriptions = 0;
-    let confirmedSubscriptions = 0;
-    let pendingSubscriptions = 0;
-    const topicDetails = [];
+    const folders = ['resumes/', 'profile-pictures/', 'institution-logos/', 'exports/'];
+    let totalFiles = 0;
+    let totalSizeBytes = 0;
+    const folderStats: Record<string, { count: number; sizeBytes: number }> = {};
 
-    // Get details for each topic
-    for (const topic of vidyamitraTopics) {
-      if (!topic.TopicArn) continue;
-
-      try {
-        const [attrs, subs] = await Promise.all([
-          sns.send(new GetTopicAttributesCommand({ TopicArn: topic.TopicArn })),
-          sns.send(new ListSubscriptionsByTopicCommand({ TopicArn: topic.TopicArn })),
-        ]);
-
-        const subsCount = parseInt(attrs.Attributes?.SubscriptionsConfirmed || '0');
-        const pendingCount = parseInt(attrs.Attributes?.SubscriptionsPending || '0');
-        const deletedCount = parseInt(attrs.Attributes?.SubscriptionsDeleted || '0');
-
-        totalSubscriptions += subsCount + pendingCount;
-        confirmedSubscriptions += subsCount;
-        pendingSubscriptions += pendingCount;
-
-        const arnParts = topic.TopicArn.split(':');
-        const topicName = arnParts[arnParts.length - 1];
-
-        topicDetails.push({
-          topicArn: topic.TopicArn,
-          topicName,
-          displayName: attrs.Attributes?.DisplayName || topicName,
-          subscriptionsConfirmed: subsCount,
-          subscriptionsPending: pendingCount,
-          subscriptionsDeleted: deletedCount,
-        });
-      } catch (err) {
-        console.error(`Failed to get topic details for ${topic.TopicArn}:`, err);
-      }
+    for (const folder of folders) {
+      const result = await s3.send(new ListObjectsV2Command({ Bucket: bucketName, Prefix: folder }));
+      const files = (result.Contents || []).filter(o => !o.Key?.endsWith('/'));
+      const size = files.reduce((sum, o) => sum + (o.Size || 0), 0);
+      folderStats[folder.replace('/', '')] = { count: files.length, sizeBytes: size };
+      totalFiles += files.length;
+      totalSizeBytes += size;
     }
 
-    // Get SNS CloudWatch metrics for messages published (7 days)
-    const totalPublishSum = await cwSum(cw, 'AWS/SNS', 'NumberOfMessagesPublished', [], 7);
-    const failedPublishSum = await cwSum(cw, 'AWS/SNS', 'NumberOfNotificationsFailed', [], 7);
-    const emailDeliveredSum = await cwSum(cw, 'AWS/SNS', 'NumberOfNotificationsDelivered', 
-      [{ Name: 'Protocol', Value: 'email' }], 7);
+    const monthlyCostEstimate = billedCosts?.s3
+      ?? computeS3Cost(totalSizeBytes, cwMetrics.s3GetRequests, cwMetrics.s3PutRequests, counters);
 
-    // Get daily publish data for chart
-    const dailyPublishes = await cwDaily(cw, 'AWS/SNS', 'NumberOfMessagesPublished', [], 7);
-
-    // Cost calculation (scale 7-day to monthly)
-    // AWS Learner Labs has NO free tier - all messages are billable
-    const freeTierMessages = isLearnerLab ? 0 : PRICING.sns_free_email;
-    const monthlyMessages = Math.round(totalPublishSum * (30 / 7));
-    const billableMessages = Math.max(0, monthlyMessages - freeTierMessages);
-    const snsCost = (billableMessages / 1_000_000) * PRICING.sns_per_1M_email;
+    const getReqs = cwMetrics.s3GetRequests > 0 ? cwMetrics.s3GetRequests : counters.s3Download + counters.s3List;
+    const putReqs = cwMetrics.s3PutRequests > 0 ? cwMetrics.s3PutRequests : counters.s3Upload;
 
     return {
-      service: 'SNS',
-      icon: 'megaphone',
-      color: 'pink',
+      service: 'S3',
       status: 'ok' as const,
       region,
-      metrics: {
-        topicCount: vidyamitraTopics.length,
-        totalSubscriptions,
-        confirmedSubscriptions,
-        pendingSubscriptions,
-        messagesPublished7d: totalPublishSum,
-        messagesFailed7d: failedPublishSum,
-        emailDelivered7d: emailDeliveredSum,
-        deliveryRate: totalPublishSum > 0 ? ((emailDeliveredSum / totalPublishSum) * 100) : 0,
-        dailyPublishes,
-        topicDetails,
+      bucketName,
+      totalFiles,
+      totalSizeBytes,
+      folderStats,
+      apiCalls: {
+        uploads: counters.s3Upload,
+        downloads: counters.s3Download,
+        deletes: counters.s3Delete,
+        lists: counters.s3List,
+        cwGetRequests: getReqs,
+        cwPutRequests: putReqs,
       },
       costs: {
-        monthlyCostEstimate: +snsCost.toFixed(4),
-        freeTierNote: isLearnerLab
-          ? 'AWS Learner Lab: NO free tier. All SNS email notifications are billable.'
-          : 'First 1,000 email notifications/month free. $2.00 per 1M after that.',
+        monthlyCostEstimate,
+        costSource: billedCosts?.s3 !== undefined ? costSource : 'Bucket listing + request counts',
+        freeTierNote: 'Free tier: 5 GB storage, 20,000 GET & 2,000 PUT requests/month.',
       },
     };
   } catch (err: any) {
-    console.error('SNS stats error:', err);
     return {
-      service: 'SNS',
-      icon: 'megaphone',
-      color: 'pink',
+      service: 'S3',
       status: 'error' as const,
-      error: err?.message || 'Failed to fetch SNS stats',
+      error: err?.message || 'Failed to fetch S3 stats',
       region,
-      metrics: {
-        topicCount: 0,
-        totalSubscriptions: 0,
-        confirmedSubscriptions: 0,
-        pendingSubscriptions: 0,
-        messagesPublished7d: 0,
-        messagesFailed7d: 0,
-        emailDelivered7d: 0,
-        deliveryRate: 0,
-        dailyPublishes: [],
-        topicDetails: [],
-      },
-      costs: {
-        monthlyCostEstimate: 0,
-        freeTierNote: isLearnerLab
-          ? 'AWS Learner Lab: NO free tier.'
-          : 'First 1,000 email notifications/month free.',
-      },
+      bucketName,
     };
   }
 }
 
-// ─── Auto-detect any additional configured AWS services ───────────────────────
+// -- Lambda Stats -------------------------------------------------------------
+
+async function getLambdaStats(
+  env: Record<string, string>,
+  billedCosts: Record<string, number> | null,
+  cwMetrics: CWUsageMetrics,
+  costSource: string,
+) {
+  const creds = makeAwsCreds(env);
+  const region = getRegion(env);
+  const functionName = getLambdaFunctionName(env);
+
+  if (!creds.accessKeyId) return null;
+
+  const lambda = new LambdaClient({ region, credentials: creds });
+
+  try {
+    const fn = await lambda.send(new GetFunctionCommand({ FunctionName: functionName }));
+    const config = fn.Configuration;
+    const memoryMB = config?.MemorySize || 128;
+
+    const monthlyCostEstimate = billedCosts?.lambda
+      ?? computeLambdaCost(cwMetrics.lambdaInvocations, cwMetrics.lambdaDurationMs, memoryMB);
+
+    return {
+      service: 'Lambda',
+      status: 'ok' as const,
+      region,
+      functionName,
+      runtime: config?.Runtime || 'nodejs',
+      memorySize: memoryMB,
+      codeSize: config?.CodeSize || 0,
+      lastModified: config?.LastModified || '',
+      invocationsThisMonth: cwMetrics.lambdaInvocations,
+      durationMsThisMonth: cwMetrics.lambdaDurationMs,
+      costs: {
+        monthlyCostEstimate,
+        costSource: billedCosts?.lambda !== undefined ? costSource
+          : cwMetrics.lambdaInvocations > 0 ? 'CloudWatch Invocations × Pricing'
+          : 'Within free tier (0 invocations recorded)',
+        freeTierNote: 'First 1M requests/month free. $0.0000002/request after. Used for Textract PDF parsing.',
+      },
+    };
+  } catch (err: any) {
+    return {
+      service: 'Lambda',
+      status: 'error' as const,
+      error: err?.message || 'Failed to fetch Lambda stats',
+      region,
+      functionName,
+    };
+  }
+}
+
+// -- Configured services list -------------------------------------------------
 
 function getConfiguredServices(env: Record<string, string>): Array<{ name: string; envKey: string; configured: boolean; note: string }> {
   const allEnv = { ...process.env, ...env };
   return [
     {
-      name: 'S3 Object Storage',
-      envKey: 'S3_BUCKET_NAME',
-      configured: !!(allEnv.S3_BUCKET_NAME || allEnv.AWS_ACCESS_KEY_ID),
-      note: allEnv.S3_BUCKET_NAME || 'vidyamitra-uploads-629496',
+      name: 'Rekognition Face Detection',
+      envKey: 'REKOGNITION_COLLECTION_ID',
+      configured: !!allEnv.AWS_ACCESS_KEY_ID,
+      note: allEnv.AWS_ACCESS_KEY_ID ? 'Active — Face analysis available' : 'Requires AWS credentials',
     },
     {
-      name: 'Lambda (Textract Resume API)',
+      name: 'SSM Parameter Store',
+      envKey: 'AWS_ACCESS_KEY_ID',
+      configured: !!allEnv.AWS_ACCESS_KEY_ID,
+      note: allEnv.AWS_ACCESS_KEY_ID ? 'Active - API keys secured (FREE tier)' : 'Requires AWS credentials',
+    },
+    {
+      name: 'S3 File Storage',
+      envKey: 'S3_BUCKET_NAME',
+      configured: !!(allEnv.S3_BUCKET_NAME && allEnv.AWS_ACCESS_KEY_ID),
+      note: allEnv.S3_BUCKET_NAME ? `Bucket: ${allEnv.S3_BUCKET_NAME}` : 'S3_BUCKET_NAME not set',
+    },
+    {
+      name: 'Lambda (Textract)',
       envKey: 'AWS_LAMBDA_RESUME_API',
       configured: !!allEnv.AWS_LAMBDA_RESUME_API,
-      note: allEnv.AWS_LAMBDA_RESUME_API ? 'API Gateway + Lambda + Textract' : 'Not configured',
-    },
-    {
-      name: 'SNS Email Marketing',
-      envKey: 'AWS_ACCESS_KEY_ID',
-      configured: !!(allEnv.AWS_ACCESS_KEY_ID),
-      note: allEnv.AWS_ACCESS_KEY_ID ? 'Active (check Marketing tab)' : 'Requires AWS credentials',
-    },
-    {
-      name: 'SES Email',
-      envKey: 'SES_FROM_EMAIL',
-      configured: !!allEnv.SES_FROM_EMAIL,
-      note: allEnv.SES_FROM_EMAIL || 'Not configured (sandbox mode in Learner Lab)',
-    },
-    {
-      name: 'Rekognition Face Detection',
-      envKey: 'REKOGNITION_ENABLED',
-      configured: !!(allEnv.REKOGNITION_ENABLED || allEnv.REKOGNITION_COLLECTION_ID),
-      note: allEnv.REKOGNITION_COLLECTION_ID ? `Collection: ${allEnv.REKOGNITION_COLLECTION_ID}` : 'Replaced by TF.js (client-side)',
-    },
-    {
-      name: 'DynamoDB',
-      envKey: 'DYNAMODB_TABLE',
-      configured: !!allEnv.DYNAMODB_TABLE,
-      note: allEnv.DYNAMODB_TABLE || 'Using Supabase instead',
-    },
-    {
-      name: 'CloudFront CDN',
-      envKey: 'CLOUDFRONT_DOMAIN',
-      configured: !!allEnv.CLOUDFRONT_DOMAIN,
-      note: allEnv.CLOUDFRONT_DOMAIN || 'Not configured',
+      note: allEnv.AWS_LAMBDA_RESUME_API ? 'Active — Resume PDF parser' : 'AWS_LAMBDA_RESUME_API not set',
     },
   ];
 }
 
-// ─── Route registration ────────────────────────────────────────────────────────
+// -- Route registration -------------------------------------------------------
 
 export function registerAwsUsageRoutes(
   server: ViteDevServer,
@@ -530,7 +512,7 @@ export function registerAwsUsageRoutes(
   getSessionAsync: (req: IncomingMessage) => Promise<{ userId: string; email: string; isAdmin: boolean; name: string } | null>,
   sendJson: (res: ServerResponse, status: number, data: any) => void,
 ) {
-  // GET /api/aws/usage — full snapshot (admin only)
+  // GET /api/aws/usage -- full snapshot (admin only)
   server.middlewares.use('/api/aws/usage', async (req: any, res: any, next: any) => {
     if (req.method !== 'GET') return next();
 
@@ -546,43 +528,46 @@ export function registerAwsUsageRoutes(
       });
     }
 
-    // Detect AWS Learner Lab (temporary STS credentials with session token)
     const isLearnerLab = !!creds.sessionToken;
-
+    const region = getRegion(env);
+    const credentialsType = creds.sessionToken ? 'STS/Learner Lab (temporary)' : 'IAM (permanent)';
     const configuredServices = getConfiguredServices(env);
 
-    // Fetch stats in parallel, fail gracefully per-service
-    const [s3, lambda, sns] = await Promise.all([
-      getS3Stats(env, isLearnerLab).catch(err => ({ error: err?.message ?? 'Failed', service: 'S3', status: 'error' })),
-      getLambdaStats(env, isLearnerLab).catch(err => ({ error: err?.message ?? 'Failed', service: 'Lambda + Textract', status: 'error' })),
-      getSNSStats(env, isLearnerLab).catch(err => ({ error: err?.message ?? 'Failed', service: 'SNS', status: 'error' })),
+    // Fetch costs (tries CloudWatch Billing → Cost Explorer → per-service CW metrics)
+    const functionName = getLambdaFunctionName(env);
+    const { billedCosts, cwMetrics, costSource } = await fetchCostData(env, functionName);
+
+    // Fetch per-service stats in parallel, all receiving cost data
+    const [rekognition, ssm, s3, lambda] = await Promise.all([
+      getRekognitionStats(env, billedCosts, cwMetrics, costSource).catch(err => ({ error: err?.message ?? 'Failed', service: 'Rekognition', status: 'error' as const })),
+      getSSMStats(env, billedCosts, costSource).catch(err => ({ error: err?.message ?? 'Failed', service: 'SSM Parameter Store', status: 'error' as const })),
+      getS3Stats(env, billedCosts, cwMetrics, costSource).catch(err => ({ error: err?.message ?? 'Failed', service: 'S3', status: 'error' as const })),
+      getLambdaStats(env, billedCosts, cwMetrics, costSource).catch(err => ({ error: err?.message ?? 'Failed', service: 'Lambda', status: 'error' as const })),
     ]);
 
-    const region = getRegion(env);
-    const budget = 50; // AWS Learner Lab credit
-    const credentialsType = creds.sessionToken ? 'STS/Learner Lab (temporary)' : 'IAM (permanent)';
-
-    // Calculate total estimated cost
-    const s3Cost = (s3 as any)?.costs?.storageCostMonthly || 0;
-    const lambdaCost = (lambda as any)?.costs?.totalMonthlyEstimate || 0;
-    const snsCost = (sns as any)?.costs?.monthlyCostEstimate || 0;
-    const totalCost = s3Cost + lambdaCost + snsCost;
+    const totalMonthlyCost = billedCosts?.total ?? (
+      ((rekognition as any)?.costs?.monthlyCostEstimate ?? 0) +
+      ((ssm as any)?.costs?.monthlyCostEstimate ?? 0) +
+      ((s3 as any)?.costs?.monthlyCostEstimate ?? 0) +
+      ((lambda as any)?.costs?.monthlyCostEstimate ?? 0)
+    );
 
     sendJson(res, 200, {
       configured: true,
       region,
       credentialsType,
-      budget,
+      budget: 50,
       isLearnerLab,
-      totalMonthlyCost: +totalCost.toFixed(4),
-      remainingBudget: +(budget - totalCost).toFixed(2),
+      totalMonthlyCost,
+      remainingBudget: Math.max(0, 50 - totalMonthlyCost),
+      costSource,
       configuredServices,
-      services: { s3, lambda, sns },
+      services: { rekognition, ssm, s3, lambda },
       fetchedAt: new Date().toISOString(),
     });
   });
 
-  // GET /api/aws/health — quick connectivity ping (admin only)
+  // GET /api/aws/health -- quick connectivity ping (admin only)
   server.middlewares.use('/api/aws/health', async (req: any, res: any, next: any) => {
     if (req.method !== 'GET') return next();
 
@@ -591,57 +576,50 @@ export function registerAwsUsageRoutes(
 
     const creds = makeAwsCreds(env);
     const region = getRegion(env);
-    const bucketName = env.S3_BUCKET_NAME || process.env.S3_BUCKET_NAME || 'vidyamitra-uploads-629496';
+    const collectionId = env.REKOGNITION_COLLECTION_ID || process.env.REKOGNITION_COLLECTION_ID || '';
 
     const checks: Record<string, { ok: boolean; detail: string }> = {};
 
+    // Rekognition ping
+    try {
+      const rekognition = new RekognitionClient({ region, credentials: creds });
+      if (collectionId) {
+        await rekognition.send(new DescribeCollectionCommand({ CollectionId: collectionId }));
+        checks.rekognition = { ok: true, detail: `Collection "${collectionId}" accessible` };
+      } else {
+        checks.rekognition = { ok: true, detail: 'Rekognition client reachable (no collection configured)' };
+      }
+    } catch (e: any) {
+      checks.rekognition = { ok: false, detail: e?.message ?? 'Rekognition check failed' };
+    }
+
+    // SSM ping
+    try {
+      const ssm = new SSMClient({ region, credentials: creds });
+      await ssm.send(new DescribeParametersCommand({ MaxResults: 1 }));
+      checks.ssm = { ok: true, detail: 'SSM Parameter Store accessible' };
+    } catch (e: any) {
+      checks.ssm = { ok: false, detail: e?.message ?? 'SSM check failed' };
+    }
+
     // S3 ping
     try {
+      const bucketName = env.S3_BUCKET_NAME || process.env.S3_BUCKET_NAME || 'vidyamitra-uploads-629496';
       const s3 = new S3Client({ region, credentials: creds });
-      await s3.send(new GetBucketLocationCommand({ Bucket: bucketName }));
-      checks.s3 = { ok: true, detail: `Bucket ${bucketName} accessible` };
+      await s3.send(new HeadBucketCommand({ Bucket: bucketName }));
+      checks.s3 = { ok: true, detail: `Bucket "${bucketName}" accessible` };
     } catch (e: any) {
       checks.s3 = { ok: false, detail: e?.message ?? 'S3 check failed' };
     }
 
-    // Lambda ping (list functions — quick and cheap)
+    // Lambda ping
     try {
+      const functionName = getLambdaFunctionName(env);
       const lambda = new LambdaClient({ region, credentials: creds });
-      await lambda.send(new ListFunctionsCommand({ MaxItems: 1 }));
-      checks.lambda = { ok: true, detail: 'Lambda API accessible' };
+      await lambda.send(new GetFunctionCommand({ FunctionName: functionName }));
+      checks.lambda = { ok: true, detail: `Function "${functionName}" reachable` };
     } catch (e: any) {
       checks.lambda = { ok: false, detail: e?.message ?? 'Lambda check failed' };
-    }
-
-    // Textract Lambda health (HTTP ping to the API GW URL)
-    const lambdaUrl = env.AWS_LAMBDA_RESUME_API || process.env.AWS_LAMBDA_RESUME_API;
-    if (lambdaUrl) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        const resp = await fetch(lambdaUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ bucket: 'ping', key: 'ping' }),
-          signal: controller.signal,
-        });
-        clearTimeout(timeout);
-        // Any HTTP response (even 500) means Lambda is reachable — the ping uses
-        // a fake bucket/key so Lambda naturally errors, but that proves connectivity.
-        checks.textract_lambda = { ok: true, detail: `Reachable (HTTP ${resp.status})` };
-      } catch (e: any) {
-        checks.textract_lambda = { ok: false, detail: e?.message ?? 'Lambda ping failed' };
-      }
-    }
-
-    // SNS ping (list topics — quick check)
-    try {
-      const sns = new SNSClient({ region, credentials: creds });
-      const topics = await sns.send(new ListTopicsCommand({ NextToken: undefined }));
-      const vidyamitraTopics = (topics.Topics || []).filter(t => t.TopicArn?.includes('vidyamitra'));
-      checks.sns = { ok: true, detail: `SNS accessible (${vidyamitraTopics.length} marketing topics)` };
-    } catch (e: any) {
-      checks.sns = { ok: false, detail: e?.message ?? 'SNS check failed' };
     }
 
     sendJson(res, 200, { checks, checkedAt: new Date().toISOString() });

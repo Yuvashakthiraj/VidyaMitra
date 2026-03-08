@@ -74,10 +74,12 @@ import {
   DollarSign,
   Megaphone,
   Send,
-  RefreshCw
+  RefreshCw,
+  ShieldCheck
 } from "lucide-react";
 import S3Manager from "@/components/S3Manager";
 import AWSUsageDashboard from "@/components/AWSUsageDashboard";
+import ProctoringSettingsTab from "@/components/ProctoringSettingsTab";
 import { subscribeToRoleChanges, toggleRoleStatusInDB } from "@/utils/roleManagement";
 import { codingQuestions } from "@/data/codingQuestions";
 import { getAIProvider, toggleAIProvider, getProviderConfig, type AIProvider } from "@/utils/aiProviderService";
@@ -144,7 +146,7 @@ const AdminDashboard = () => {
   const [aiProvider, setAiProvider] = useState<AIProvider>(getAIProvider());
 
   // Active View State for sidebar navigation
-  const [activeView, setActiveView] = React.useState<'dashboard' | 'round1' | 'round2' | 'coding' | 'institutions' | 'roles' | 'resume' | 'storage' | 'aws' | 'marketing'>('dashboard');
+  const [activeView, setActiveView] = React.useState<'dashboard' | 'round1' | 'round2' | 'coding' | 'institutions' | 'roles' | 'resume' | 'storage' | 'aws' | 'marketing' | 'proctoring'>('dashboard');
 
   // SNS Marketing State
   const [snsTopics, setSnsTopics] = useState<any[]>([]);
@@ -903,6 +905,15 @@ const AdminDashboard = () => {
                 <Megaphone className="h-4 w-4" />
                 Marketing
               </Button>
+              <Button
+                variant={activeView === 'proctoring' ? 'default' : 'ghost'}
+                onClick={() => setActiveView('proctoring')}
+                className="gap-2 whitespace-nowrap"
+                size="sm"
+              >
+                <ShieldCheck className="h-4 w-4" />
+                Proctoring
+              </Button>
             </div>
           </div>
         </div>
@@ -1601,6 +1612,11 @@ const AdminDashboard = () => {
               </div>
             )}
 
+            {/* Proctoring Settings View */}
+            {activeView === 'proctoring' && (
+              <ProctoringSettingsTab />
+            )}
+
             {/* Round 1 - Aptitude View */}
             {activeView === 'round1' && (
               <div className="space-y-4">
@@ -1734,9 +1750,11 @@ const AdminDashboard = () => {
                                   </TableCell>
                                   <TableCell>
                                     {result.aborted ? (
-                                      <span className="text-xs text-red-600" title={result.abortReason}>
-                                        {result.abortReason ? (result.abortReason.length > 30 ? result.abortReason.substring(0, 30) + '...' : result.abortReason) : 'Violated'}
-                                      </span>
+                                      <div className="max-w-[200px]">
+                                        <span className="text-xs text-red-600 whitespace-normal break-words">
+                                          {result.abortReason || 'Violated'}
+                                        </span>
+                                      </div>
                                     ) : (
                                       <Badge variant="outline" className="bg-green-50 text-green-700 text-xs">
                                         Clean

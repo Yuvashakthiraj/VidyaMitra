@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Video, VideoOff, ShieldCheck, ShieldAlert, ShieldX, Loader2, Smartphone } from 'lucide-react';
+import { Video, VideoOff, ShieldCheck, ShieldAlert, ShieldX, Loader2, Smartphone, Brain, Cloud } from 'lucide-react';
 import { Button } from './ui/button';
 import { useFaceDetection, type FaceViolation, type ProctorStatus } from '@/hooks/useFaceDetection';
+import { useRekognition, type RekognitionViolation, type RekognitionStatus } from '@/hooks/useRekognition';
 import { useProctoringSettings } from '@/hooks/useProctoringSettings';
 
 interface WebcamPanelProps {
@@ -18,11 +19,13 @@ interface WebcamPanelProps {
 
 const STRIKE_COOLDOWN_MS = 2000;
 
-const STATUS_CONFIG: Record<ProctorStatus, { color: string; bg: string; icon: typeof ShieldCheck }> = {
+const STATUS_CONFIG: Record<ProctorStatus | RekognitionStatus, { color: string; bg: string; icon: typeof ShieldCheck }> = {
+  idle:    { color: 'text-gray-300', bg: 'bg-gray-500/80', icon: ShieldCheck },
   loading: { color: 'text-blue-300', bg: 'bg-blue-500/80', icon: Loader2 },
   ok:      { color: 'text-green-300', bg: 'bg-green-600/80', icon: ShieldCheck },
   warning: { color: 'text-yellow-300', bg: 'bg-yellow-500/80', icon: ShieldAlert },
   violation: { color: 'text-red-300', bg: 'bg-red-600/90', icon: ShieldX },
+  error:   { color: 'text-red-300', bg: 'bg-red-600/90', icon: ShieldX },
 };
 
 export default function WebcamPanel({ onStreamReady, onViolation, onWarning, proctoring = true, objectDetection = true }: WebcamPanelProps) {
@@ -45,18 +48,56 @@ export default function WebcamPanel({ onStreamReady, onViolation, onWarning, pro
   const onWarningRef = useRef(onWarning);
   onWarningRef.current = onWarning;
 
-  // Always enable TF proctoring when proctoring=true — do not gate on settings.tensorflow
-  // (DB may have tensorflow:false from when Rekognition was active).
-  const tfEnabled = proctoring && isVideoEnabled && !error;
-  const objEnabled = proctoring && settings.objectDetection && objectDetection;
+  // ── Determine which engines are active based on settings ──
+  const { proctoringMode } = settings;
+  const tfShouldRun = proctoringMode === 'tensorflow' || proctoringMode === 'both';
+  const rekShouldRun = proctoringMode === 'rekognition' || proctoringMode === 'both';
+
+  // Always enable TF proctoring when proctoring=true AND mode supports it
+  const tfEnabled = proctoring && isVideoEnabled && !error && tfShouldRun;
+  const objEnabled = proctoring && settings.objectDetection && objectDetection && tfShouldRun;
+
+  // Enable Rekognition when mode supports it
+  const rekEnabled = proctoring && isVideoEnabled && !error && rekShouldRun;
 
   // ── Client-side face detection (TF.js — every ~1.5s) ─────
-  const { status, faceCount, violation, warningCount, statusMessage, detectedObjects } = useFaceDetection(videoRef, {
+  const { 
+    status: tfStatus, 
+    faceCount: tfFaceCount, 
+    violation: tfViolation, 
+    statusMessage: tfStatusMessage, 
+    detectedObjects: tfDetectedObjects 
+  } = useFaceDetection(videoRef, {
     enabled: tfEnabled,
     intervalMs: settings.tfIntervalMs,
     noFaceStrikeSec: settings.noFaceStrikeSec,
     objectDetection: objEnabled,
   });
+
+  // ── Server-side face detection (AWS Rekognition — every ~3s) ─────
+  const {
+    status: rekStatus,
+    faceCount: rekFaceCount,
+    violation: rekViolation,
+    statusMessage: rekStatusMessage,
+    prohibitedObjects: rekProhibitedObjects,
+    metadata: rekMetadata,
+    metadataHistory: rekMetadataHistory,
+    isConfigured: rekIsConfigured,
+  } = useRekognition(videoRef, {
+    enabled: rekEnabled,
+    intervalMs: settings.rekognitionIntervalMs,
+    noFaceStrikeSec: settings.noFaceStrikeSec,
+    objectDetection: settings.rekognitionObjectDetection,
+  });
+
+  // ── Compute combined status ──
+  const status = tfEnabled ? tfStatus : rekEnabled ? rekStatus : 'ok' as ProctorStatus;
+  const faceCount = tfEnabled ? tfFaceCount : rekFaceCount;
+  const statusMessage = tfEnabled ? tfStatusMessage : rekStatusMessage;
+  
+  // Only show prohibited objects (phones, tablets, books) - no more clothing/furniture noise
+  const prohibitedItems = rekProhibitedObjects || [];
 
   /**
    * Unified strike handler — TF.js feeds into this.
@@ -91,15 +132,17 @@ export default function WebcamPanel({ onStreamReady, onViolation, onWarning, pro
 
   // Forward TF.js violations to unified strike handler
   useEffect(() => {
-    if (!violation) return;
-    // Strip the "⚠️ Strike N: " prefix and the trailing "— Next violation..." / "— Interview aborted!" suffix
-    // so handleGlobalStrike can wrap cleanly with its own formatting.
-    const detail = violation.message
-      .replace(/^[^\w]*(Strike \d+:\s*)?/i, '')
-      .replace(/\s*—\s*(Next violation.*|Interview aborted.*)$/i, '')
-      .trim();
-    handleGlobalStrike(violation.type, detail || violation.message);
-  }, [violation, handleGlobalStrike]);
+    if (!tfViolation) return;
+    // Hooks now report raw messages without strike prefixes
+    handleGlobalStrike(tfViolation.type, tfViolation.message);
+  }, [tfViolation, handleGlobalStrike]);
+
+  // Forward Rekognition violations to unified strike handler
+  useEffect(() => {
+    if (!rekViolation) return;
+    // Forward ALL violations — the global handler decides strike #
+    handleGlobalStrike(rekViolation.type as FaceViolation['type'], rekViolation.message);
+  }, [rekViolation, handleGlobalStrike]);
 
   // ── Webcam start / stop ──────────────────────────────────
   useEffect(() => {
@@ -225,28 +268,21 @@ export default function WebcamPanel({ onStreamReady, onViolation, onWarning, pro
                 {status === 'loading' ? 'INIT' : `${faceCount} face${faceCount !== 1 ? 's' : ''}`}
               </span>
             </div>
-            {/* Detected prohibited objects (TF.js) */}
-            {detectedObjects.length > 0 && (
+            {/* Detected prohibited objects (phones, tablets, books only) */}
+            {prohibitedItems.length > 0 && (
               <div className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-600/90">
                 <Smartphone className="w-2.5 h-2.5 text-red-200" />
                 <span className="text-white text-[10px] font-bold">
-                  {[...new Set(detectedObjects.map((o) => o.class))].join(', ')}
+                  {[...new Set(prohibitedItems.map((o) => o.name))].join(', ')}
                 </span>
               </div>
             )}
-            {/* Engine indicators */}
-            {proctoring && (
-              <div className="flex gap-1">
-                {settings.tensorflow && (
-                  <div className="bg-indigo-600/70 px-1.5 py-0.5 rounded-full">
-                    <span className="text-white text-[8px] font-bold">TF.js</span>
-                  </div>
-                )}
-                {settings.objectDetection && (
-                  <div className="bg-orange-600/70 px-1.5 py-0.5 rounded-full">
-                    <span className="text-white text-[8px] font-bold">OBJ</span>
-                  </div>
-                )}
+            {/* Strike counter */}
+            {proctoring && strikeDisplay > 0 && (
+              <div className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-600/90">
+                <span className="text-white text-[10px] font-bold">
+                  {strikeDisplay}/2 strikes
+                </span>
               </div>
             )}
           </div>

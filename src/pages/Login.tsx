@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { useTypewriter } from '@/hooks/useTypewriter';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/components/ui/use-toast';
@@ -10,10 +11,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
-import { GraduationCap, AlertCircle, Eye, EyeOff, Building2, User } from 'lucide-react';
+import { AlertCircle, Eye, EyeOff, Building2, User } from 'lucide-react';
+import VidyaMitraLogo from '@/components/VidyaMitraLogo';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import { institutionsApi } from '@/lib/api';
 import type { Institution } from '@/types/auth';
 
@@ -65,6 +67,15 @@ const Login = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [loginType, setLoginType] = useState<'student' | 'institution'>('student');
   const [institutions, setInstitutions] = useState<Institution[]>([]);
+
+  // ── Typewriter hero word ─────────────────────────────────────────────
+  const { displayText: heroWord } = useTypewriter({
+    words: ['Mastery', 'Excellence', 'Intelligence', 'Innovation', 'Growth'],
+    typingSpeed: 75,
+    deletingSpeed: 50,
+    pauseDuration: 1500,
+    variableSpeed: { min: 60, max: 120 },
+  });
 
   const from = location.state?.from?.pathname || '/dashboard';
 
@@ -166,53 +177,100 @@ const Login = () => {
   };
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex min-h-screen relative">
       {/* Left panel - branding */}
       <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-br from-violet-950 via-purple-900 to-indigo-950 relative overflow-hidden">
         <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHZpZXdCb3g9IjAgMCA2MCA2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZyBmaWxsPSJub25lIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiPjxnIGZpbGw9IiNmZmYiIGZpbGwtb3BhY2l0eT0iMC4wMyI+PHBhdGggZD0iTTM2IDM0djItSDI0di0yaDEyem0wLTR2Mkg4di0yaDI4em0tOCA2djJINC12LTJoMjR6Ii8+PC9nPjwvZz48L3N2Zz4=')] opacity-50" />
         <div className="relative z-10 flex flex-col justify-center px-12 lg:px-16">
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6 }}>
             <div className="flex items-center gap-3 mb-8">
-              <div className="w-14 h-14 rounded-2xl bg-white/10 backdrop-blur-sm flex items-center justify-center border border-white/20">
-                <GraduationCap className="h-8 w-8 text-white" />
-              </div>
+              <VidyaMitraLogo size={56} />
               <div>
                 <h1 className="text-3xl font-bold text-white">VidyaMitra</h1>
                 <p className="text-violet-200 text-sm">AI Career Companion</p>
               </div>
             </div>
             <h2 className="text-4xl lg:text-5xl font-bold text-white mb-6 leading-tight">
-              Your Path to<br />
-              <span className="bg-gradient-to-r from-violet-300 to-pink-300 bg-clip-text text-transparent">Career Excellence</span>
+              Your Career Companion for<br />
+              <span className="inline-block relative" style={{ minWidth: '1ch' }}>
+                <span className="bg-gradient-to-r from-violet-300 to-pink-300 bg-clip-text text-transparent">{heroWord}</span>
+                <motion.span
+                  animate={{ opacity: [1, 1, 0, 0] }}
+                  transition={{ duration: 0.5, repeat: Infinity, repeatType: 'loop', times: [0, 0.5, 0.5, 1] }}
+                  className="text-violet-300"
+                  style={{ marginLeft: '2px' }}>
+                  |
+                </motion.span>
+              </span>
             </h2>
             <p className="text-violet-200/80 text-lg mb-10 max-w-md">
               AI-powered interviews, smart resume analysis, personalized career roadmaps, and real-time job matching — all in one platform.
             </p>
             <div className="grid grid-cols-2 gap-4 max-w-md">
               {[
-                { label: 'Smart Resume Analysis', icon: '📄' },
-                { label: 'AI Mock Interviews', icon: '🎯' },
-                { label: 'Career Roadmaps', icon: '🗺️' },
-                { label: 'Job Matching', icon: '💼' },
-              ].map((f, i) => (
+                'Smart Resume Analysis',
+                'AI Mock Interviews',
+                'Career Roadmaps',
+                'Job Matching',
+              ].map((label, i) => (
                 <motion.div
                   key={i}
                   initial={{ opacity: 0, x: -20 }}
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ delay: 0.3 + i * 0.1 }}
-                  className="flex items-center gap-2 bg-white/5 backdrop-blur-sm rounded-lg px-3 py-2.5 border border-white/10"
+                  className="relative overflow-hidden rounded-lg px-4 py-3 border border-white/10 backdrop-blur-sm"
+                  style={{
+                    background: 'linear-gradient(135deg, rgba(167,139,250,0.08) 0%, rgba(244,114,182,0.08) 100%)',
+                  }}
                 >
-                  <span className="text-lg">{f.icon}</span>
-                  <span className="text-white/90 text-xs font-medium">{f.label}</span>
+                  {/* shine sweep */}
+                  <div
+                    className="pointer-events-none absolute inset-0 opacity-30"
+                    style={{
+                      background: 'linear-gradient(105deg, transparent 30%, rgba(255,255,255,0.18) 50%, transparent 70%)',
+                      animation: `shine-${i} 3.5s ${i * 0.7}s infinite`,
+                    }}
+                  />
+                  <span
+                    className="relative text-xs font-semibold tracking-wide"
+                    style={{
+                      background: 'linear-gradient(135deg, #c4b5fd 0%, #f9a8d4 60%, #a5b4fc 100%)',
+                      WebkitBackgroundClip: 'text',
+                      WebkitTextFillColor: 'transparent',
+                      textShadow: 'none',
+                    }}
+                  >
+                    {label}
+                  </span>
                 </motion.div>
               ))}
             </div>
+            <style>{`
+              @keyframes shine-0 { 0%,100%{transform:translateX(-100%)} 40%,60%{transform:translateX(200%)} }
+              @keyframes shine-1 { 0%,100%{transform:translateX(-100%)} 40%,60%{transform:translateX(200%)} }
+              @keyframes shine-2 { 0%,100%{transform:translateX(-100%)} 40%,60%{transform:translateX(200%)} }
+              @keyframes shine-3 { 0%,100%{transform:translateX(-100%)} 40%,60%{transform:translateX(200%)} }
+            `}</style>
           </motion.div>
         </div>
       </div>
 
       {/* Right panel - form */}
       <div className="flex-1 flex items-center justify-center p-6 bg-background">
+        {/* Back to home button — top-left of right panel */}
+        <button
+          onClick={() => navigate('/home')}
+          className="absolute top-5 right-5 lg:top-6 lg:right-8 flex items-center gap-1.5 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors duration-200 group z-10"
+        >
+          <svg
+            viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"
+            className="w-4 h-4 transition-transform duration-200 group-hover:-translate-x-0.5"
+          >
+            <path d="M10 12L6 8L10 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          Back to Home
+        </button>
+
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -221,9 +279,7 @@ const Login = () => {
         >
           {/* Mobile logo */}
           <div className="flex items-center gap-3 justify-center mb-8 lg:hidden">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-600 to-purple-600 flex items-center justify-center">
-              <GraduationCap className="h-6 w-6 text-white" />
-            </div>
+            <VidyaMitraLogo size={40} />
             <h1 className="text-2xl font-bold gradient-text">VidyaMitra</h1>
           </div>
 

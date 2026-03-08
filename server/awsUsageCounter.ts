@@ -15,6 +15,7 @@ interface UsageStats {
   snsSubscribe: number;
   snsPublish: number;
   snsTopicCreate: number;
+  rekognitionAnalysis: number;
 }
 
 // In-memory usage counters (resets on server restart)
@@ -27,6 +28,7 @@ const usageStats: UsageStats = {
   snsSubscribe: 0,
   snsPublish: 0,
   snsTopicCreate: 0,
+  rekognitionAnalysis: 0,
 };
 
 // S3 Tracking Functions
@@ -64,6 +66,11 @@ export function trackSNSTopicCreate() {
   usageStats.snsTopicCreate++;
 }
 
+// Rekognition Tracking Functions
+export async function trackRekognitionAnalysis(count: number = 1) {
+  usageStats.rekognitionAnalysis += count;
+}
+
 // Get current stats (for debugging or admin dashboard)
 export function getUsageStats(): UsageStats {
   return { ...usageStats };
@@ -79,4 +86,5 @@ export function resetUsageStats() {
   usageStats.snsSubscribe = 0;
   usageStats.snsPublish = 0;
   usageStats.snsTopicCreate = 0;
+  usageStats.rekognitionAnalysis = 0;
 }

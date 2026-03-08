@@ -183,7 +183,7 @@ const InterviewRules: React.FC<InterviewRulesProps> = ({ onAccept, onCancel }) =
                 <UserX className="h-5 w-5 mt-0.5 text-red-600 dark:text-red-400 flex-shrink-0" />
                 <div>
                   <p className="text-sm font-medium text-foreground">Don't let others appear on camera</p>
-                  <p className="text-xs text-muted-foreground">Multiple faces detected by AI or leaving the camera frame for more than 7 seconds triggers a strike.</p>
+                  <p className="text-xs text-muted-foreground">Multiple faces detected by AI or leaving the camera frame for more than 5 seconds triggers a strike.</p>
                 </div>
               </div>
 

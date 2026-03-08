@@ -13,6 +13,7 @@ import { registerSubscriptionRoutes } from './subscriptionRoutes';
 import { registerS3Routes, initS3 } from './s3Routes';
 import { registerAwsUsageRoutes } from './awsUsageRoutes';
 import { registerSNSRoutes, initSNS } from './snsRoutes';
+import { registerRekognitionRoutes, initRekognition } from './rekognitionRoutes';
 import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
 import { trackSESEmail } from './awsUsageCounter';
 import { loadEnvWithSecrets } from './secretsManager';
@@ -626,10 +627,22 @@ Score by: language relevance to role (40%), recency of activity (30%), quantity 
 // ==================== PERSISTENT PROCTORING SETTINGS ====================
 // Module-level so settings survive Vite HMR (loaded from DB on first request)
 let proctoringSettings = {
+    // Engine mode: 'tensorflow' | 'rekognition' | 'both'
+    proctoringMode: 'tensorflow' as 'tensorflow' | 'rekognition' | 'both',
+    // TensorFlow settings
     tensorflow: true,
     objectDetection: true,
     tfIntervalMs: 1500,
     noFaceStrikeSec: 5,
+    // Rekognition settings
+    rekognition: false,
+    rekognitionIntervalMs: 3000,  // Higher interval to reduce API calls and cost
+    rekognitionObjectDetection: true,
+    // Advanced Rekognition options
+    rekognitionLookAwayDetection: true,  // Detect if user is looking away
+    rekognitionFaceCoverageDetection: true,  // Detect sunglasses etc.
+    maxYawAngle: 30,  // Max face yaw angle before violation
+    maxPitchAngle: 25,  // Max face pitch angle before violation
 };
 let _procSettingsLoaded = false;
 
@@ -640,7 +653,10 @@ async function loadProctoringSettingsFromDB(): Promise<void> {
         if (row?.value) {
             const saved = typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
             Object.assign(proctoringSettings, saved);
-            proctoringSettings.tensorflow = true; // Always forced — Rekognition removed, TF.js is the only proctoring engine
+            // Maintain backward compatibility - if mode not set, use tensorflow if enabled
+            if (!saved.proctoringMode) {
+                proctoringSettings.proctoringMode = saved.tensorflow !== false ? 'tensorflow' : 'rekognition';
+            }
         }
         _procSettingsLoaded = true; // Only set to true if query succeeds
     } catch {
@@ -714,6 +730,9 @@ export function vidyaMitraApiPlugin(): Plugin {
 
             // Initialize AWS SNS for marketing
             initSNS(env);
+
+            // Initialize AWS Rekognition for proctoring
+            initRekognition(env);
         },
 
         configureServer(server: ViteDevServer) {
@@ -1050,6 +1069,9 @@ export function vidyaMitraApiPlugin(): Plugin {
             // ==================== SNS MARKETING NOTIFICATIONS ====================
             registerSNSRoutes(server, resolvedEnv, getSessionAsync, sendJson, parseBody);
 
+            // ==================== AWS REKOGNITION PROCTORING ====================
+            registerRekognitionRoutes(server, resolvedEnv, getSessionAsync, sendJson, parseBody);
+
             // GET/POST /api/settings/proctoring — admin proctoring settings (DB-persisted)
             server.middlewares.use('/api/settings/proctoring', async (req: any, res: any, next: any) => {
                 if (req.method === 'GET') {
@@ -1066,10 +1088,26 @@ export function vidyaMitraApiPlugin(): Plugin {
                     if (!session?.isAdmin) return sendJson(res, 403, { error: 'Admin access required' });
                     try {
                         const body = await parseBody(req);
+                        // Proctoring mode
+                        if (body.proctoringMode && ['tensorflow', 'rekognition', 'both'].includes(body.proctoringMode)) {
+                            proctoringSettings.proctoringMode = body.proctoringMode;
+                            // Sync boolean flags with mode for backward compatibility
+                            proctoringSettings.tensorflow = body.proctoringMode === 'tensorflow' || body.proctoringMode === 'both';
+                            proctoringSettings.rekognition = body.proctoringMode === 'rekognition' || body.proctoringMode === 'both';
+                        }
+                        // TensorFlow settings
                         if (typeof body.tensorflow === 'boolean') proctoringSettings.tensorflow = body.tensorflow;
                         if (typeof body.objectDetection === 'boolean') proctoringSettings.objectDetection = body.objectDetection;
                         if (typeof body.tfIntervalMs === 'number') proctoringSettings.tfIntervalMs = Math.max(1000, Math.min(10000, body.tfIntervalMs));
                         if (typeof body.noFaceStrikeSec === 'number') proctoringSettings.noFaceStrikeSec = Math.max(3, Math.min(15, body.noFaceStrikeSec));
+                        // Rekognition settings
+                        if (typeof body.rekognition === 'boolean') proctoringSettings.rekognition = body.rekognition;
+                        if (typeof body.rekognitionIntervalMs === 'number') proctoringSettings.rekognitionIntervalMs = Math.max(2000, Math.min(10000, body.rekognitionIntervalMs));
+                        if (typeof body.rekognitionObjectDetection === 'boolean') proctoringSettings.rekognitionObjectDetection = body.rekognitionObjectDetection;
+                        if (typeof body.rekognitionLookAwayDetection === 'boolean') proctoringSettings.rekognitionLookAwayDetection = body.rekognitionLookAwayDetection;
+                        if (typeof body.rekognitionFaceCoverageDetection === 'boolean') proctoringSettings.rekognitionFaceCoverageDetection = body.rekognitionFaceCoverageDetection;
+                        if (typeof body.maxYawAngle === 'number') proctoringSettings.maxYawAngle = Math.max(15, Math.min(60, body.maxYawAngle));
+                        if (typeof body.maxPitchAngle === 'number') proctoringSettings.maxPitchAngle = Math.max(15, Math.min(45, body.maxPitchAngle));
                         await saveProctoringSettingsToDB();
                         return sendJson(res, 200, { success: true, settings: proctoringSettings });
                     } catch (err: any) {

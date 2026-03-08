@@ -1,21 +1,40 @@
 /**
- * Resume Service - Replaces Firebase-based resume storage
+ * Resume Service - Handles resume storage in S3 and database.
  */
 
-import { resumesApi, s3Api } from './api';
+import { resumesApi, apiFetch } from './api';
 import { ParsedResume } from '@/utils/resumeParser';
 
 /**
- * Upload the actual PDF file to S3 for permanent storage.
- * Returns the S3 key if successful, null otherwise.
+ * Uploads a resume file to S3 bucket (resumes/ folder) via presigned URL.
+ * Returns the S3 object key on success, or null on failure.
  */
 export const uploadResumeToS3 = async (file: File): Promise<string | null> => {
   try {
-    const result = await s3Api.uploadFile(file, 'resumes');
-    console.log('☁️ Resume uploaded to S3:', result.key);
-    return result.key;
-  } catch (error) {
-    console.error('❌ Failed to upload resume to S3:', error);
+    // Step 1: Get a presigned upload URL from the server
+    const { uploadUrl, key } = await apiFetch('/api/s3/upload-url', {
+      method: 'POST',
+      body: JSON.stringify({
+        fileName: file.name,
+        contentType: file.type || 'application/pdf',
+        folder: 'resumes',
+      }),
+    });
+
+    // Step 2: PUT the file directly to S3 using the presigned URL (no auth headers)
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'PUT',
+      body: file,
+      headers: { 'Content-Type': file.type || 'application/pdf' },
+    });
+
+    if (!uploadRes.ok) {
+      throw new Error(`S3 upload failed: ${uploadRes.status} ${uploadRes.statusText}`);
+    }
+
+    return key as string;
+  } catch (err) {
+    console.error('uploadResumeToS3 error:', err);
     return null;
   }
 };

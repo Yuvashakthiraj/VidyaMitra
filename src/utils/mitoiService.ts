@@ -6,6 +6,7 @@
 
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import { getAuthToken } from "@/lib/api";
+import { searchCourses, parseCourseQuery, formatCoursesForChat, Course } from "./chatCourseEngine";
 
 // ==================== CONFIG ====================
 const API_KEY = import.meta.env.VITE_GEMINI_CHATBOT_API_KEY || '';
@@ -265,12 +266,29 @@ function detectQuizIntent(message: string): string | null {
   return 'general';
 }
 
+// ==================== COURSE INTENT DETECTION ====================
+function detectCourseIntent(message: string): { detected: boolean; query: ReturnType<typeof parseCourseQuery> } {
+  const lower = message.toLowerCase().trim();
+  const courseSignals = [
+    'course', 'courses', 'tutorial', 'tutorials', 'learn', 'learning', 'study',
+    'recommend', 'suggestion', 'suggest', 'teach me', 'how to learn',
+    'where to learn', 'best way to learn', 'resources for', 'want to learn',
+    'udemy', 'coursera', 'youtube', 'edx', 'pluralsight', 'udacity',
+    'free course', 'paid course', 'beginner course', 'advanced course'
+  ];
+
+  const detected = courseSignals.some(s => lower.includes(s));
+  const query = parseCourseQuery(message);
+
+  return { detected, query };
+}
+
 // ==================== MAIN CHAT FUNCTION ====================
 export async function sendMitoiMessage(
   message: string,
   history: MitoiMessage[],
   context: { currentPage?: string; userName?: string }
-): Promise<{ response: string; action?: MitoiAction; quizCategory?: string }> {
+): Promise<{ response: string; action?: MitoiAction; quizCategory?: string; courses?: Course[] }> {
   const trimmed = message.trim();
   if (!trimmed) return { response: "Please type a message! 😊" };
 
@@ -290,6 +308,23 @@ export async function sendMitoiMessage(
       response: `Great! Let's start a **${quizCategory.charAt(0).toUpperCase() + quizCategory.slice(1)} Quiz** 🧠\n\nI'll ask you 5 questions. Ready? Here comes the first one!`,
       quizCategory,
     };
+  }
+
+  // 2.5. Check course intent (free — no API call)
+  const courseIntent = detectCourseIntent(trimmed);
+  if (courseIntent.detected && (courseIntent.query.skill || courseIntent.query.platform)) {
+    const courses = searchCourses(
+      courseIntent.query.skill || courseIntent.query.rawQuery,
+      courseIntent.query.platform || undefined,
+      8
+    );
+    if (courses.length > 0) {
+      const formatted = formatCoursesForChat(courses.map(c => c.course), trimmed);
+      return {
+        response: formatted,
+        courses: courses.map(c => c.course),
+      };
+    }
   }
 
   // 3. Check for simple greetings (free)

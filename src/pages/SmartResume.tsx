@@ -13,7 +13,8 @@ import { Textarea } from '@/components/ui/textarea';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import {
     Upload, FileText, CheckCircle, XCircle, AlertCircle, Trophy, Download,
-    Plus, Trash2, ChevronRight, ChevronLeft, Eye, Sparkles, GraduationCap, UserCircle
+    Plus, Trash2, ChevronRight, ChevronLeft, Eye, Sparkles, GraduationCap, UserCircle,
+    Building2, Search, Star, TrendingUp
 } from 'lucide-react';
 import { processResume, processResumeFromText, extractTextViaTextract } from '@/utils/atsParser';
 import { ResumeData } from '@/types';
@@ -21,9 +22,14 @@ import { toast } from 'sonner';
 import { geminiApi, resumeBuilderApi } from '@/lib/api';
 import { generateResumeSkillGaps } from '@/utils/learningRecommendations';
 import LearningRecommendations from '@/components/LearningRecommendations';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import jsPDF from 'jspdf';
 import { loadResumeFromProfile, saveResumeToProfile, logActivity, type SavedResume } from '@/utils/profileService';
+import { 
+    COMPANIES, COMPANY_JDS, getAllCompanies, getJD, getJDsByCompany, 
+    scoreResumeAgainstJD, findBestRolesForResume, 
+    type CompanyJD, type JDMatchResult, type RoleRecommendation 
+} from '@/data/companyJDs';
 
 const JOB_ROLES = [
     'Software Engineer', 'Frontend Developer', 'Backend Developer', 'Full Stack Developer',
@@ -66,11 +72,92 @@ const ResumeUploadSection = () => {
     const [profileResume, setProfileResume] = useState<SavedResume | null>(null);
     const [loadingProfile, setLoadingProfile] = useState(false);
     const [textractUsed, setTextractUsed] = useState(false);
+    
+    // NEW: Company-specific JD matching state
+    const [targetCompany, setTargetCompany] = useState<string | undefined>(undefined);
+    const [companyJDMatch, setCompanyJDMatch] = useState<JDMatchResult | null>(null);
+    const [selectedJD, setSelectedJD] = useState<CompanyJD | null>(null);
+    
+    // NEW: Role recommendations state
+    const [showRoleRecommendations, setShowRoleRecommendations] = useState(false);
+    const [roleRecommendations, setRoleRecommendations] = useState<RoleRecommendation[]>([]);
+    const [findingRoles, setFindingRoles] = useState(false);
 
     // Check for saved resume on mount
     useEffect(() => {
         loadResumeFromProfile().then(r => setProfileResume(r)).catch(() => {});
     }, []);
+
+    // Get available companies
+    const availableCompanies = getAllCompanies();
+    
+    // Get available roles for selected company
+    const companyRoles = targetCompany ? getJDsByCompany(targetCompany).map(jd => jd.role) : [];
+
+    const effectiveRole = targetRole === 'Other' ? customRole : targetRole;
+
+    // Update JD match when company and role are selected (and resume exists)
+    useEffect(() => {
+        if (resume && targetCompany && effectiveRole) {
+            console.log('🏢 Attempting company JD match:', { 
+                company: targetCompany, 
+                role: effectiveRole,
+                hasResume: !!resume,
+                hasAtsAnalysis: !!resume.atsAnalysis,
+                matchedSkills: resume.atsAnalysis?.matchedSkills?.length || 0,
+                parsedSkills: resume.parsedData?.skills?.length || 0
+            });
+            
+            const jd = getJD(targetCompany, effectiveRole);
+            if (jd) {
+                console.log('✅ Found JD for', targetCompany, '-', effectiveRole);
+                setSelectedJD(jd);
+                const allSkills = [...(resume.atsAnalysis?.matchedSkills || []), ...(resume.parsedData?.skills || [])].filter(Boolean);
+                const experienceYears = resume.parsedData?.totalExperienceYears || 0;
+                console.log('📊 Scoring resume with', allSkills.length, 'skills and', experienceYears, 'years exp');
+                const matchResult = scoreResumeAgainstJD(allSkills, experienceYears, jd);
+                console.log('✅ Company JD Match Result:', matchResult);
+                setCompanyJDMatch(matchResult);
+            } else {
+                console.warn('⚠️ No JD found for', targetCompany, '-', effectiveRole);
+                setSelectedJD(null);
+                setCompanyJDMatch(null);
+            }
+        } else {
+            console.log('⚠️ Company JD match conditions not met:', {
+                hasResume: !!resume,
+                targetCompany,
+                effectiveRole
+            });
+            setSelectedJD(null);
+            setCompanyJDMatch(null);
+        }
+    }, [resume, targetCompany, effectiveRole]);
+
+    // Find Best Roles function
+    const handleFindBestRoles = async () => {
+        if (!resume) {
+            toast.error('Please upload a resume first');
+            return;
+        }
+        
+        setFindingRoles(true);
+        try {
+            const allSkills = [...(resume.atsAnalysis?.matchedSkills || []), ...(resume.parsedData?.skills || [])].filter(Boolean);
+            const experienceYears = resume.parsedData?.totalExperienceYears || 0;
+            
+            const recommendations = findBestRolesForResume(allSkills, experienceYears, 15);
+            setRoleRecommendations(recommendations);
+            setShowRoleRecommendations(true);
+            
+            toast.success(`Found ${recommendations.length} matching roles!`);
+            await logActivity('role_recommendation', 'Best Roles Analysis', `Found ${recommendations.length} matching roles`).catch(() => {});
+        } catch (err) {
+            toast.error('Failed to find matching roles');
+        } finally {
+            setFindingRoles(false);
+        }
+    };
 
     const handleLoadFromProfile = async () => {
         if (!profileResume) return;
@@ -91,7 +178,7 @@ const ResumeUploadSection = () => {
             if (processedResume.atsAnalysis) {
                 try {
                     const allSkills = [...(processedResume.atsAnalysis.matchedSkills || []), ...(processedResume.parsedData.skills || [])].filter(Boolean);
-                    const gaps = generateResumeSkillGaps(allSkills, effectiveRole, processedResume.atsScore);
+                    const gaps = generateResumeSkillGaps(allSkills, effectiveRole, processedResume.atsScore, processedResume.atsAnalysis);
                     setSkillGapAnalysis(gaps);
                 } catch { /* ignore */ }
             }
@@ -106,8 +193,6 @@ const ResumeUploadSection = () => {
             setLoadingProfile(false);
         }
     };
-
-    const effectiveRole = targetRole === 'Other' ? customRole : targetRole;
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const f = e.target.files?.[0];
@@ -152,7 +237,7 @@ const ResumeUploadSection = () => {
             if (processedResume.atsAnalysis) {
                 try {
                     const allSkills = [...(processedResume.atsAnalysis.matchedSkills || []), ...(processedResume.parsedData.skills || [])].filter(Boolean);
-                    const gaps = generateResumeSkillGaps(allSkills, effectiveRole, processedResume.atsScore);
+                    const gaps = generateResumeSkillGaps(allSkills, effectiveRole, processedResume.atsScore, processedResume.atsAnalysis);
                     setSkillGapAnalysis(gaps);
                 } catch { }
             }
@@ -179,16 +264,30 @@ const ResumeUploadSection = () => {
 
     return (
         <div className="space-y-6">
-            {/* Role Selection */}
+            {/* Role & Company Selection */}
             <Card className="border-border/50">
                 <CardContent className="pt-6 space-y-4">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                         <div>
                             <Label>Target Job Role *</Label>
                             <Select value={targetRole} onValueChange={setTargetRole}>
                                 <SelectTrigger><SelectValue placeholder="Select a role..." /></SelectTrigger>
                                 <SelectContent>
                                     {JOB_ROLES.map(role => <SelectItem key={role} value={role}>{role}</SelectItem>)}
+                                </SelectContent>
+                            </Select>
+                        </div>
+                        <div>
+                            <Label className="flex items-center gap-1.5">
+                                <Building2 className="h-3.5 w-3.5" />
+                                Target Company <span className="text-xs text-muted-foreground">(optional)</span>
+                            </Label>
+                            <Select value={targetCompany || ''} onValueChange={(v) => { setTargetCompany(v || undefined); setCompanyJDMatch(null); }}>
+                                <SelectTrigger><SelectValue placeholder="Any company..." /></SelectTrigger>
+                                <SelectContent>
+                                    {availableCompanies.map(company => (
+                                        <SelectItem key={company} value={company}>{company}</SelectItem>
+                                    ))}
                                 </SelectContent>
                             </Select>
                         </div>
@@ -200,11 +299,21 @@ const ResumeUploadSection = () => {
                         )}
                     </div>
 
-                    <div className="flex gap-3">
-                        <Input type="file" accept=".pdf" onChange={handleFileChange} disabled={processing} className="flex-1" />
+                    {/* File Upload & Actions */}
+                    <div className="flex gap-3 flex-wrap">
+                        <Input type="file" accept=".pdf" onChange={handleFileChange} disabled={processing} className="flex-1 min-w-[200px]" />
                         <Button onClick={handleUpload} disabled={!file || processing || !effectiveRole}
                             className="bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-700 hover:to-purple-700 min-w-[120px]">
                             {processing ? 'Analyzing...' : <><Upload className="mr-2 h-4 w-4" />Upload</>}
+                        </Button>
+                        <Button 
+                            variant="outline" 
+                            onClick={handleFindBestRoles} 
+                            disabled={!resume || findingRoles}
+                            className="gap-2 border-amber-500/50 text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/30"
+                        >
+                            <Search className="h-4 w-4" />
+                            {findingRoles ? 'Finding...' : 'Find Best Roles'}
                         </Button>
                     </div>
 
@@ -223,7 +332,7 @@ const ResumeUploadSection = () => {
                         </div>
                     )}
 
-                    <p className="text-xs text-muted-foreground">📄 PDF only • Max 5MB</p>
+                    <p className="text-xs text-muted-foreground">📄 PDF only • Max 5MB • Select a company for company-specific JD matching</p>
                 </CardContent>
             </Card>
 
@@ -288,6 +397,174 @@ const ResumeUploadSection = () => {
 
                     {skillGapAnalysis && (
                         <LearningRecommendations skillGapAnalysis={skillGapAnalysis} title="📚 Skill Gap & Course Recommendations" showOverallScore={true} />
+                    )}
+
+                    {/* Company JD Match Results */}
+                    {companyJDMatch && (
+                        <Card className="mt-6 border-blue-500/30 bg-gradient-to-br from-blue-500/5 to-purple-500/5">
+                            <CardHeader>
+                                <div className="flex items-center justify-between">
+                                    <CardTitle className="text-lg flex items-center gap-2">
+                                        <Building2 className="h-5 w-5 text-blue-500" />
+                                        {targetCompany} - {effectiveRole} Match
+                                    </CardTitle>
+                                    <Badge variant={companyJDMatch.overallScore >= 80 ? 'default' : companyJDMatch.overallScore >= 60 ? 'secondary' : 'destructive'}>
+                                        {companyJDMatch.overallScore}% Fit
+                                    </Badge>
+                                </div>
+                            </CardHeader>
+                            <CardContent className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div className="p-4 rounded-lg bg-green-500/10 border border-green-500/20">
+                                        <p className="text-sm font-medium text-green-600 mb-2">Must-Have Skills Score</p>
+                                        <p className="text-3xl font-bold text-green-500">{companyJDMatch.mustHaveScore}%</p>
+                                        <Progress value={companyJDMatch.mustHaveScore} className="mt-2" />
+                                    </div>
+                                    <div className="p-4 rounded-lg bg-blue-500/10 border border-blue-500/20">
+                                        <p className="text-sm font-medium text-blue-600 mb-2">Nice-to-Have Skills Score</p>
+                                        <p className="text-3xl font-bold text-blue-500">{companyJDMatch.niceToHaveScore}%</p>
+                                        <Progress value={companyJDMatch.niceToHaveScore} className="mt-2" />
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <p className="text-sm font-medium mb-2 flex items-center gap-2">
+                                            <CheckCircle className="h-4 w-4 text-green-500" /> 
+                                            Matched Must-Have ({companyJDMatch.matchedMustHaves.length})
+                                        </p>
+                                        <div className="flex flex-wrap gap-1.5">
+                                            {companyJDMatch.matchedMustHaves.map((s, i) => (
+                                                <Badge key={i} variant="outline" className="bg-green-500/10 text-green-600 border-green-500/20 text-xs">{s}</Badge>
+                                            ))}
+                                        </div>
+                                    </div>
+                                    {companyJDMatch.missedMustHaves.length > 0 && (
+                                        <div>
+                                            <p className="text-sm font-medium mb-2 flex items-center gap-2">
+                                                <AlertCircle className="h-4 w-4 text-red-500" /> 
+                                                Missing Must-Have ({companyJDMatch.missedMustHaves.length})
+                                            </p>
+                                            <div className="flex flex-wrap gap-1.5">
+                                                {companyJDMatch.missedMustHaves.map((s, i) => (
+                                                    <Badge key={i} variant="outline" className="bg-red-500/10 text-red-600 border-red-500/20 text-xs">{s}</Badge>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <p className="text-sm font-medium mb-2 flex items-center gap-2">
+                                            <Star className="h-4 w-4 text-blue-500" /> 
+                                            Matched Nice-to-Have ({companyJDMatch.matchedNiceToHaves.length})
+                                        </p>
+                                        <div className="flex flex-wrap gap-1.5">
+                                            {companyJDMatch.matchedNiceToHaves.map((s, i) => (
+                                                <Badge key={i} variant="outline" className="bg-blue-500/10 text-blue-600 border-blue-500/20 text-xs">{s}</Badge>
+                                            ))}
+                                        </div>
+                                    </div>
+                                    {companyJDMatch.missedNiceToHaves.length > 0 && (
+                                        <div>
+                                            <p className="text-sm font-medium mb-2 flex items-center gap-2">
+                                                <AlertCircle className="h-4 w-4 text-yellow-500" /> 
+                                                Missing Nice-to-Have ({companyJDMatch.missedNiceToHaves.length})
+                                            </p>
+                                            <div className="flex flex-wrap gap-1.5">
+                                                {companyJDMatch.missedNiceToHaves.slice(0, 8).map((s, i) => (
+                                                    <Badge key={i} variant="outline" className="bg-yellow-500/10 text-yellow-600 border-yellow-500/20 text-xs">{s}</Badge>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <Alert className={companyJDMatch.overallScore >= 70 ? 'border-green-500/30 bg-green-500/5' : 'border-yellow-500/30 bg-yellow-500/5'}>
+                                    <TrendingUp className="h-4 w-4" />
+                                    <AlertDescription>
+                                        {companyJDMatch.overallScore >= 80 
+                                            ? `Excellent match for ${targetCompany}! Your profile aligns well with this role.`
+                                            : companyJDMatch.overallScore >= 60 
+                                            ? `Good potential for ${targetCompany}. Focus on the missing must-have skills to strengthen your application.`
+                                            : `Consider building skills in ${companyJDMatch.missedMustHaves.slice(0, 3).join(', ')} before applying to ${targetCompany}.`
+                                        }
+                                    </AlertDescription>
+                                </Alert>
+                            </CardContent>
+                        </Card>
+                    )}
+
+                    {/* Role Recommendations Section */}
+                    {showRoleRecommendations && roleRecommendations.length > 0 && (
+                        <Card className="mt-6 border-purple-500/30 bg-gradient-to-br from-purple-500/5 to-pink-500/5">
+                            <CardHeader>
+                                <div className="flex items-center justify-between">
+                                    <CardTitle className="text-lg flex items-center gap-2">
+                                        <TrendingUp className="h-5 w-5 text-purple-500" />
+                                        Top Role Recommendations Based on Your Resume
+                                    </CardTitle>
+                                    <Button variant="ghost" size="sm" onClick={() => setShowRoleRecommendations(false)}>
+                                        ✕ Close
+                                    </Button>
+                                </div>
+                                <p className="text-sm text-muted-foreground">
+                                    We analyzed your resume against 40+ job descriptions across 15 top companies
+                                </p>
+                            </CardHeader>
+                            <CardContent>
+                                <div className="space-y-3 max-h-[500px] overflow-y-auto">
+                                    {roleRecommendations.map((rec, index) => (
+                                        <div 
+                                            key={index} 
+                                            className="p-4 rounded-lg border bg-card hover:bg-accent/50 transition-colors cursor-pointer"
+                                            onClick={() => {
+                                                setTargetCompany(rec.jd.company);
+                                                setTargetRole(rec.jd.role);
+                                                setShowRoleRecommendations(false);
+                                                toast.success(`Selected ${rec.jd.role} at ${rec.jd.company}`);
+                                            }}
+                                        >
+                                            <div className="flex items-center justify-between mb-2">
+                                                <div className="flex items-center gap-3">
+                                                    <span className="text-2xl font-bold text-purple-500">#{index + 1}</span>
+                                                    <div>
+                                                        <p className="font-semibold">{rec.jd.role}</p>
+                                                        <p className="text-sm text-muted-foreground flex items-center gap-1">
+                                                            <Building2 className="h-3 w-3" /> {rec.jd.company}
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                                <div className="text-right">
+                                                    <Badge variant={rec.matchResult.overallScore >= 80 ? 'default' : rec.matchResult.overallScore >= 60 ? 'secondary' : 'outline'}>
+                                                        {rec.matchResult.overallScore}% Match
+                                                    </Badge>
+                                                </div>
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-2 text-xs">
+                                                <div className="flex items-center gap-1">
+                                                    <span className="text-green-500">●</span> Must-Have: {rec.matchResult.mustHaveScore}%
+                                                </div>
+                                                <div className="flex items-center gap-1">
+                                                    <span className="text-blue-500">●</span> Nice-to-Have: {rec.matchResult.niceToHaveScore}%
+                                                </div>
+                                            </div>
+                                            {rec.matchResult.matchedMustHaves.length > 0 && (
+                                                <div className="mt-2 flex flex-wrap gap-1">
+                                                    {rec.matchResult.matchedMustHaves.slice(0, 5).map((skill, i) => (
+                                                        <Badge key={i} variant="outline" className="text-xs bg-green-500/5">{skill}</Badge>
+                                                    ))}
+                                                    {rec.matchResult.matchedMustHaves.length > 5 && (
+                                                        <Badge variant="outline" className="text-xs">+{rec.matchResult.matchedMustHaves.length - 5} more</Badge>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+                            </CardContent>
+                        </Card>
                     )}
                 </motion.div>
             )}

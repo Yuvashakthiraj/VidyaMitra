@@ -13,6 +13,7 @@ import {
   sendMentorMessage,
   MentorContext,
 } from '@/utils/mitoiService';
+import { searchCourses, parseCourseQuery, formatCoursesForChat } from '@/utils/chatCourseEngine';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -160,6 +161,39 @@ export default function MitoiChat() {
 
     setIsLoading(true);
     try {
+      // Check for course intent first (works in both modes)
+      const lower = text.toLowerCase().trim();
+      const courseSignals = [
+        'course', 'courses', 'tutorial', 'tutorials', 'learn', 'learning', 'study',
+        'recommend', 'suggestion', 'suggest', 'teach me', 'how to learn',
+        'where to learn', 'best way to learn', 'resources for', 'want to learn',
+        'udemy', 'coursera', 'youtube', 'edx', 'pluralsight', 'udacity',
+        'free course', 'paid course', 'beginner course', 'advanced course'
+      ];
+      
+      const hasCourseIntent = courseSignals.some(s => lower.includes(s));
+      
+      if (hasCourseIntent) {
+        try {
+          const query = parseCourseQuery(text);
+          const courses = searchCourses(
+            query.skill || query.rawQuery,
+            query.platform || undefined,
+            8
+          );
+          
+          if (courses.length > 0) {
+            const formatted = formatCoursesForChat(courses.map(c => c.course), text);
+            addAssistantMessage(formatted);
+            setIsLoading(false);
+            return;
+          }
+        } catch (err) {
+          console.error('Course search error:', err);
+          // Fall through to mentor mode if course search fails
+        }
+      }
+      
       // Route to career mentor if in mentor mode
       if (mode === 'mentor') {
         const result = await sendMentorMessage(text, messages, mentorContext);
@@ -392,7 +426,7 @@ export default function MitoiChat() {
                         '📊 What should I focus on?',
                         '📝 Make me a study plan',
                         '🎓 Interview tips for my role',
-                        '🚀 How to improve my score?',
+                        '� Suggest courses for skill gaps',
                       ].map((action, i) => (
                         <Badge
                           key={i}
@@ -485,15 +519,89 @@ export default function MitoiChat() {
 
 // ==================== MARKDOWN-LITE RENDERER ====================
 function MitoiContent({ content }: { content: string }) {
-  // Simple markdown: **bold**, *italic*, and newlines
+  // Simple markdown: **bold**, *italic*, [links](url), and newlines
   const lines = content.split('\n');
+
+  // URL regex pattern for detecting links
+  const urlPattern = /(https?:\/\/[^\s\)]+)/g;
+  // Markdown link pattern: [text](url)
+  const mdLinkPattern = /\[([^\]]+)\]\(([^)]+)\)/g;
+
+  const renderWithLinks = (text: string) => {
+    // First handle markdown-style links [text](url)
+    const parts: (string | JSX.Element)[] = [];
+    let lastIndex = 0;
+    let match;
+
+    // Reset regex
+    mdLinkPattern.lastIndex = 0;
+
+    while ((match = mdLinkPattern.exec(text)) !== null) {
+      // Add text before match
+      if (match.index > lastIndex) {
+        parts.push(text.slice(lastIndex, match.index));
+      }
+      // Add the link
+      parts.push(
+        <a 
+          key={`md-${match.index}`}
+          href={match[2]} 
+          target="_blank" 
+          rel="noopener noreferrer"
+          className="text-blue-500 hover:text-blue-400 underline underline-offset-2"
+        >
+          {match[1]}
+        </a>
+      );
+      lastIndex = match.index + match[0].length;
+    }
+
+    // Add remaining text
+    if (lastIndex < text.length) {
+      parts.push(text.slice(lastIndex));
+    }
+
+    // If no markdown links found, check for raw URLs
+    if (parts.length === 0 || (parts.length === 1 && typeof parts[0] === 'string')) {
+      const textToProcess = parts.length === 1 ? parts[0] as string : text;
+      const urlParts: (string | JSX.Element)[] = [];
+      let urlLastIndex = 0;
+
+      urlPattern.lastIndex = 0;
+      while ((match = urlPattern.exec(textToProcess)) !== null) {
+        if (match.index > urlLastIndex) {
+          urlParts.push(textToProcess.slice(urlLastIndex, match.index));
+        }
+        urlParts.push(
+          <a 
+            key={`url-${match.index}`}
+            href={match[1]} 
+            target="_blank" 
+            rel="noopener noreferrer"
+            className="text-blue-500 hover:text-blue-400 underline underline-offset-2"
+          >
+            {match[1].length > 40 ? match[1].slice(0, 40) + '...' : match[1]}
+          </a>
+        );
+        urlLastIndex = match.index + match[0].length;
+      }
+
+      if (urlLastIndex < textToProcess.length) {
+        urlParts.push(textToProcess.slice(urlLastIndex));
+      }
+
+      if (urlParts.length > 0) return urlParts;
+    }
+
+    return parts.length > 0 ? parts : [text];
+  };
 
   return (
     <div className="space-y-1">
       {lines.map((line, i) => {
         if (!line.trim()) return <div key={i} className="h-1" />;
 
-        // Bold: **text**
+        // Bold: **text**, Italic: *text*, and links
         const parts = line.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
         return (
           <p key={i}>
@@ -504,7 +612,9 @@ function MitoiContent({ content }: { content: string }) {
               if (part.startsWith('*') && part.endsWith('*')) {
                 return <em key={j} className="italic opacity-90">{part.slice(1, -1)}</em>;
               }
-              return <span key={j}>{part}</span>;
+              // Check for links in the text
+              const linkParts = renderWithLinks(part);
+              return <span key={j}>{linkParts}</span>;
             })}
           </p>
         );

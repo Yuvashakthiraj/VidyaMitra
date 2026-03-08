@@ -1,7 +1,7 @@
 /**
  * AI Provider Service — Unified abstraction layer
  * 
- * Routes AI calls to either Gemini (direct frontend) or OpenAI (backend proxy)
+ * Routes AI calls to either Gemini (direct frontend), OpenAI (backend proxy), or Groq (direct frontend)
  * based on the current provider selection.
  * 
  * Provider preference is stored in localStorage and can be toggled
@@ -33,9 +33,16 @@ import {
   testOpenAIAPI,
 } from './openaiService';
 
+// Groq services (direct frontend calls)
+import {
+  analyzeResumeWithGroq,
+  generateQuestionsWithGroq,
+  testGroqAPI,
+} from './groqService';
+
 // ==================== TYPES ====================
 
-export type AIProvider = 'gemini' | 'openai';
+export type AIProvider = 'gemini' | 'openai' | 'groq';
 
 export interface AIProviderConfig {
   provider: AIProvider;
@@ -62,6 +69,13 @@ const PROVIDER_CONFIGS: Record<AIProvider, AIProviderConfig> = {
     model: 'gpt-4.1-mini',
     isBackendProxy: true,
   },
+  groq: {
+    provider: 'groq',
+    displayName: 'Groq Llama 3.3',
+    description: 'Direct frontend calls to Llama 3.3 70B via Groq',
+    model: 'llama-3.3-70b-versatile',
+    isBackendProxy: false,
+  },
 };
 
 const STORAGE_KEY = 'mockmate_ai_provider';
@@ -74,11 +88,11 @@ const STORAGE_KEY = 'mockmate_ai_provider';
 export function getAIProvider(): AIProvider {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored === 'gemini' || stored === 'openai') {
+    if (stored === 'gemini' || stored === 'openai' || stored === 'groq') {
       return stored;
     }
   } catch {}
-  return 'gemini'; // Default to Gemini
+  return 'groq'; // Default to Groq for resume analysis
 }
 
 /**
@@ -125,6 +139,9 @@ export async function testCurrentAI(): Promise<{ success: boolean; response?: st
   if (provider === 'openai') {
     return testOpenAIAPI();
   }
+  if (provider === 'groq') {
+    return testGroqAPI();
+  }
   return testGeminiAPI();
 }
 
@@ -137,6 +154,9 @@ export async function generateQuestions(roleTitle: string): Promise<GeneratedQue
   
   if (provider === 'openai') {
     return generateQuestionsWithOpenAI(roleTitle);
+  }
+  if (provider === 'groq') {
+    return generateQuestionsWithGroq(roleTitle);
   }
   return generateQuestionsWithGemini(roleTitle);
 }
@@ -177,6 +197,9 @@ export async function analyzeResume(resumeText: string, targetRole: string): Pro
   
   if (provider === 'openai') {
     return analyzeResumeWithOpenAI(resumeText, targetRole);
+  }
+  if (provider === 'groq') {
+    return analyzeResumeWithGroq(resumeText, targetRole);
   }
   return analyzeResumeWithGemini(resumeText, targetRole);
 }

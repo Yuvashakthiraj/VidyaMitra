@@ -913,19 +913,91 @@ const normalizeRoleId = (role: string): string => {
 export const generateResumeSkillGaps = (
   detectedSkills: string[],
   targetRole: string,
-  atsScore: number
+  atsScore: number,
+  aiAnalysis?: any  // Optional AI analysis with improvements and missing_skills_for_target_role
 ): SkillGapAnalysis => {
   const roleId = normalizeRoleId(targetRole);
   const requiredSkills = roleSkillMaps[roleId] || [];
-  const missingSkills = requiredSkills.filter(skill =>
-    !detectedSkills.some(detected =>
-      detected.toLowerCase().includes(skill.toLowerCase()) ||
-      skill.toLowerCase().includes(detected.toLowerCase())
-    )
-  );
+  
+  console.log('🎯 Generating skill gaps:', { 
+    targetRole, 
+    roleId, 
+    requiredSkillsCount: requiredSkills.length,
+    detectedSkillsCount: detectedSkills.length,
+    atsScore,
+    hasAIAnalysis: !!aiAnalysis
+  });
+  
+  // Prioritize AI-generated improvements and missing skills
+  let weaknesses: string[] = [];
+  
+  if (aiAnalysis?.improvements && aiAnalysis.improvements.length > 0) {
+    console.log('✅ Using AI-generated improvements from Groq');
+    weaknesses = [...aiAnalysis.improvements];
+    
+    // Also add AI-identified missing skills
+    if (aiAnalysis.missing_skills_for_target_role && aiAnalysis.missing_skills_for_target_role.length > 0) {
+      console.log('✅ Adding AI-identified missing skills');
+      weaknesses = [...weaknesses, ...aiAnalysis.missing_skills_for_target_role];
+    }
+    
+    // Remove duplicates
+    weaknesses = [...new Set(weaknesses)];
+    console.log('📊 AI-generated weaknesses:', weaknesses);
+  } else {
+    console.log('⚠️ No AI improvements available, falling back to rule-based analysis');
+    
+    // Fallback: rule-based missing skills detection
+    const missingSkills = requiredSkills.filter(skill =>
+      !detectedSkills.some(detected =>
+        detected.toLowerCase().includes(skill.toLowerCase()) ||
+        skill.toLowerCase().includes(detected.toLowerCase())
+      )
+    );
 
-  const learningPaths = generateLearningPaths(missingSkills, roleId);
-  const recommendedCourses = getRecommendedCourses(missingSkills, roleId, atsScore / 10);
+    console.log('📊 Missing skills (rule-based):', missingSkills);
+
+    // Enhanced: If score is low, ensure we have weaknesses even if all role skills are present
+    weaknesses = missingSkills;
+    
+    if (atsScore < 70 && weaknesses.length === 0) {
+      console.log('⚠️ Low ATS score but no missing skills - generating improvement areas');
+      
+      // Generate improvement areas based on common requirements
+      const improvementAreas = [];
+      
+      if (atsScore < 40) {
+        improvementAreas.push(
+          'Resume formatting and structure',
+          'Quantifiable achievements',
+          'Action verbs and impact statements',
+          'Relevant keywords for the role',
+          'Professional summary'
+        );
+      } else if (atsScore < 70) {
+        improvementAreas.push(
+          'More detailed project descriptions',
+          'Quantified results and metrics',
+          'Advanced technical skills',
+          'Leadership and collaboration examples'
+        );
+      }
+      
+      // Add role-specific skills as potential improvements
+      if (requiredSkills.length > 0) {
+        const additionalSkills = requiredSkills.slice(0, 5).filter(skill => 
+          !improvementAreas.includes(skill)
+        );
+        improvementAreas.push(...additionalSkills);
+      }
+      
+      weaknesses = improvementAreas.slice(0, 8);
+      console.log('✅ Generated weaknesses (fallback):', weaknesses);
+    }
+  }
+
+  const learningPaths = generateLearningPaths(weaknesses, roleId);
+  const recommendedCourses = getRecommendedCourses(weaknesses, roleId, atsScore / 10);
 
   // If no courses from role-based matching, provide general recommendations
   const finalCourses = recommendedCourses.length > 0 ? recommendedCourses :
@@ -937,7 +1009,7 @@ export const generateResumeSkillGaps = (
   return {
     overallScore: atsScore,
     strengths: detectedSkills,
-    weaknesses: missingSkills,
+    weaknesses: weaknesses,
     learningPaths,
     recommendedCourses: finalCourses
   };

@@ -205,19 +205,19 @@ const GapAnalysis = () => {
       }
 
       if (res.status === 404) {
-        console.log('No previous analysis found - that\'s okay, run a new analysis');
+        console.log('📋 No previous analysis found - ready to run new analysis');
         return; // This is fine, user hasn't run analysis yet
       }
 
       if (!res.ok) {
-        console.warn(`Unexpected response status: ${res.status}`);
+        console.log(`📋 No previous analysis available (status: ${res.status})`);
         return; // Don't try to parse HTML as JSON
       }
 
       // Only parse JSON if response is OK
       const contentType = res.headers.get('content-type');
       if (!contentType || !contentType.includes('application/json')) {
-        console.warn('Response is not JSON, skipping parse');
+        console.log('📋 No previous analysis available - ready to run new analysis');
         return;
       }
 
@@ -370,13 +370,13 @@ const GapAnalysis = () => {
         const data = await res.json();
         setNarrative(data.narrative);
       } else {
-        console.warn(`Narrative API returned ${res.status}`);
+        console.log(`📝 AI narrative unavailable (status: ${res.status}) - continuing without it`);
         // Don't show error toast - narrative is optional, analysis still works
         try {
           const errorData = await res.json();
-          console.error('Narrative error:', errorData.error);
+          console.log('📝 Narrative error details:', errorData.error);
         } catch {
-          console.error('Could not parse narrative error response');
+          // Silently continue - narrative is optional
         }
       }
     } catch (err) {
@@ -402,7 +402,7 @@ const GapAnalysis = () => {
         const data = await res.json();
         setSkillExplanation(data.explanation);
       } else {
-        console.warn(`Skill explanation API returned ${res.status}`);
+        console.log(`📚 Skill explanation unavailable (status: ${res.status})`);
         toast.error('Could not generate skill explanation. Please try again.');
       }
     } catch (err) {
