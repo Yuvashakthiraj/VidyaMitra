@@ -1,4 +1,4 @@
-# MockMate
+# VidyaMitra
 
 **AI-Powered Mock Interview & Resume Shortlisting Platform**
 
@@ -31,7 +31,7 @@ MockMate is a full-stack web application that simulates real interview experienc
 | Layer | Technology |
 |-------|------------|
 | **Frontend** | React 18, TypeScript, Vite, Tailwind CSS, shadcn/ui |
-| **Backend** | Firebase (Auth, Firestore, Storage, Cloud Functions) |
+| **Backend** | cloud (aws s3, lambda, ec2) |
 | **AI** | Google Gemini API, OpenAI GPT-4.1 (server-side proxy) |
 | **Code Execution** | Judge0 API via RapidAPI |
 | **Voice** | Web Speech API (Speech Recognition + Synthesis) |
@@ -41,12 +41,6 @@ MockMate is a full-stack web application that simulates real interview experienc
 
 ## Getting Started
 
-### Prerequisites
-
-- [Node.js](https://nodejs.org/) (v18+)
-- [Firebase CLI](https://firebase.google.com/docs/cli) (`npm install -g firebase-tools`)
-- A Firebase project ([setup guide](FIREBASE_SETUP.md))
-- API keys for Google Gemini, Judge0, and optionally OpenAI
 
 ### Installation
 
@@ -72,14 +66,7 @@ cp .env.example .env
 
 Edit `.env` with your actual API keys:
 
-```env
-# Firebase
-VITE_FIREBASE_API_KEY=your_firebase_api_key
-VITE_FIREBASE_AUTH_DOMAIN=your_project.firebaseapp.com
-VITE_FIREBASE_PROJECT_ID=your_project_id
-VITE_FIREBASE_STORAGE_BUCKET=your_project.appspot.com
-VITE_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
-VITE_FIREBASE_APP_ID=your_app_id
+
 
 # Google Gemini AI
 VITE_GEMINI_API_KEY=your_gemini_api_key
@@ -111,11 +98,7 @@ npm run build
 npm run preview
 ```
 
-### Deploy to Firebase
 
-```bash
-firebase deploy
-```
 
 ---
 
@@ -143,7 +126,6 @@ mockmate/
 
 ## Documentation
 
-- [Firebase Setup Guide](FIREBASE_SETUP.md)
 - [FRIEDE Bot Documentation](FRIEDE_BOT_DOCUMENTATION.md)
 - [Multi-Round Interview System](MULTI_ROUND_SYSTEM.md)
 - [Security Enhancements](SECURITY_ENHANCEMENTS.md)
