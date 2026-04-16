@@ -248,8 +248,7 @@ export const ResumeUpload = ({ roleId, onResumeProcessed, minimumScore = 60, sho
             const skillGaps = generateResumeSkillGaps(
               allSkills,
               roleId,
-              processedResume.atsScore,
-              processedResume.atsAnalysis
+              processedResume.atsScore
             );
             setSkillGapAnalysis(skillGaps);
             console.log("✅ Skill gap analysis generated");

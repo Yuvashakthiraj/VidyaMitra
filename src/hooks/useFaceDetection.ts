@@ -38,7 +38,7 @@ const CLASS_DISPLAY_NAMES: Record<string, string> = {
 };
 
 export interface UseFaceDetectionOptions {
-  /** How often (ms) to run detection. Lower = more responsive but heavier. Default 1000 */
+  /** How often (ms) to run detection. Lower = more responsive but heavier. Default 1500 */
   intervalMs?: number;
   /** Seconds of 0-face before a strike is counted. Default 5 */
   noFaceStrikeSec?: number;
@@ -56,9 +56,10 @@ export interface DetectedObject {
 export interface UseFaceDetectionReturn {
   status: ProctorStatus;
   faceCount: number;
-  /** The latest violation. null until something fires. No internal strike counting — WebcamPanel handles that. */
+  /** The latest violation (warning OR fatal). null until something fires. */
   violation: FaceViolation | null;
   violations: FaceViolation[];
+  warningCount: number;
   statusMessage: string;
   /** Prohibited objects currently visible in frame */
   detectedObjects: DetectedObject[];
@@ -102,7 +103,7 @@ export function useFaceDetection(
   options: UseFaceDetectionOptions = {}
 ): UseFaceDetectionReturn {
   const {
-    intervalMs = 1000,  // 1 second for faster detection
+    intervalMs = 1500,
     noFaceStrikeSec = 5,
     enabled = true,
     objectDetection = true,
@@ -112,11 +113,14 @@ export function useFaceDetection(
   const [faceCount, setFaceCount] = useState(0);
   const [violation, setViolation] = useState<FaceViolation | null>(null);
   const [violations, setViolations] = useState<FaceViolation[]>([]);
+  const [warningCount, setWarningCount] = useState(0);
   const [statusMessage, setStatusMessage] = useState('Initializing proctoring...');
   const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([]);
 
   // Mutable counters that persist across renders without triggering re-renders
   const noFaceStart = useRef<number | null>(null);
+  const strikeCount = useRef(0);
+  const aborted = useRef(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cycleCount = useRef(0);
   /**
@@ -153,23 +157,40 @@ export function useFaceDetection(
   );
 
   /**
-   * Report a violation — no internal strike counting.
-   * WebcamPanel's global handler is the single source of truth for strikes.
+   * Strike system: 1st offense → warning, 2nd → abort.
+   * Returns true if this strike is fatal (2nd time).
    */
-  const reportViolation = useCallback(
+  const recordStrike = useCallback(
     (type: 'no_face' | 'multiple_faces' | 'prohibited_object', detailMsg: string) => {
+      strikeCount.current += 1;
+      const count = strikeCount.current;
+      const isFatal = count >= 2;
+
       const v: FaceViolation = {
         type,
-        message: detailMsg,
+        message: isFatal
+          ? `⛔ Strike 2: ${detailMsg} — Interview aborted!`
+          : `⚠️ Strike 1: ${detailMsg} — Next violation will abort the interview!`,
         timestamp: Date.now(),
         snapshot: captureSnapshot(),
-        isFatal: false, // WebcamPanel decides fatality
+        isFatal,
       };
 
+      setWarningCount(count);
       pushViolation(v);
+      // Always reset the no-face timer after any strike so the loop doesn't
+      // immediately re-fire on the very next cycle.
       noFaceStart.current = null;
-      setStatus('warning');
-      setStatusMessage(detailMsg);
+
+      if (isFatal) {
+        setStatus('violation');
+        setStatusMessage(v.message);
+      } else {
+        setStatus('warning');
+        setStatusMessage(v.message);
+      }
+
+      return isFatal;
     },
     [captureSnapshot, pushViolation]
   );
@@ -209,7 +230,7 @@ export function useFaceDetection(
 
       // ── Detection loop ───────────────────────────────────
       const detect = async () => {
-        if (cancelled) return;
+        if (cancelled || aborted.current) return;
 
         const video = videoRef.current;
         if (!video || video.readyState < 2 || video.videoWidth === 0) return;
@@ -228,7 +249,7 @@ export function useFaceDetection(
             faceModel.estimateFaces(video, false),
             objModel ? (objModel.detect(video) as Promise<any[]>) : Promise.resolve([] as any[]),
           ]);
-          if (cancelled) return;
+          if (cancelled || aborted.current) return;
 
           const count = facePreds.length;
           setFaceCount(count);
@@ -258,7 +279,7 @@ export function useFaceDetection(
               if (consecutiveObjectHits.current >= CONSECUTIVE_HITS_NEEDED) {
                 consecutiveObjectHits.current = 0;
                 const names = [...new Set(prohibited.map((p) => p.class))].join(', ');
-                reportViolation('prohibited_object', `Prohibited object detected: ${names}`);
+                recordStrike('prohibited_object', `Prohibited object detected: ${names}`);
                 return;
               }
 
@@ -276,7 +297,7 @@ export function useFaceDetection(
           // bright screen or pattern may be what BlazeFace is counting as a
           // second face. The object violation will fire on the next cycle.
           if (count >= 2 && !prohibitedPending) {
-            reportViolation('multiple_faces', `${count} faces detected — another person in frame`);
+            recordStrike('multiple_faces', `${count} faces detected — another person in frame`);
             return;
           }
 
@@ -285,8 +306,7 @@ export function useFaceDetection(
             if (noFaceStart.current === null) noFaceStart.current = Date.now();
             const elapsed = (Date.now() - noFaceStart.current) / 1000;
             if (elapsed >= noFaceStrikeSec) {
-              reportViolation('no_face', 'No face detected for too long');
-              noFaceStart.current = Date.now(); // Reset so it doesn't re-fire every cycle
+              recordStrike('no_face', 'No face detected for too long');
               return;
             }
             setStatus('ok');
@@ -297,8 +317,13 @@ export function useFaceDetection(
 
           // ── 4) All clear ─────────────────────────────────────────────
           if (count >= 1 && !prohibitedPending) {
-            setStatus('ok');
-            setStatusMessage('Proctoring active ✓');
+            if (strikeCount.current === 0) {
+              setStatus('ok');
+              setStatusMessage('Proctoring active ✓');
+            } else {
+              setStatus('ok');
+              setStatusMessage(`Face detected ✓ — ${strikeCount.current}/2 warnings used`);
+            }
           }
         } catch (err) {
           console.warn('[Proctor] detection cycle error:', err);
@@ -316,5 +341,5 @@ export function useFaceDetection(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, intervalMs, noFaceStrikeSec, objectDetection]);
 
-  return { status, faceCount, violation, violations, statusMessage, detectedObjects };
+  return { status, faceCount, violation, violations, warningCount, statusMessage, detectedObjects };
 }
