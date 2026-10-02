@@ -1,5 +1,12 @@
 # VidyaMitra
 
+**Collaboration Notice:** VidyaMitra is a joint capstone project developed collaboratively by [Yuvashakthiraj](https://github.com/Yuvashakthiraj) and [Ganesh Ram K](https://github.com/GaneshRam15).
+
+**My Specific Contributions:**
+*   **AI & Conversational Logic:** Engineered the prompt architecture and backend integration for the FRIEDE Bot using the Google Gemini API and Web Speech API to facilitate real-time, voice-based mock interviews.
+*   **Resume Parsing & NLP:** Developed the ATS (Applicant Tracking System) compatibility scoring pipeline, utilizing pdf.js to extract text and analyze resumes against job descriptions.
+*   **Explainable Feedback & Security:** Implemented the AI-generated performance reporting system to provide candidates with transparent, actionable feedback, and contributed to the anti-cheating/malpractice detection mechanisms.
+
 **AI-Powered Mock Interview & Resume Shortlisting Platform**
 
 VidyaMitra is a full-stack web application that simulates real interview experiences using AI. It helps candidates practice interviews with instant feedback, and enables recruiters to shortlist resumes efficiently using ATS scoring.
